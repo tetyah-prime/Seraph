@@ -1,0 +1,99 @@
+#version 450
+
+// Fused cross-entropy loss and gradient for next-token prediction.
+//
+// For each row r:
+//   p = softmax(logits[r])
+//   loss[r] = -log(p[target[r]])
+//   grad_logits[r, c] = (p[c] - 1{c==target})
+//
+// Memory layout:
+//   logits: [rows, cols] float
+//   targets: [rows] uint
+//   grad_logits: [rows, cols] float
+//   loss_rows: [rows] float
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer BufferLogits { float logits[]; };
+layout(binding = 1) readonly buffer BufferTargets { uint targets[]; };
+layout(binding = 2) buffer BufferGrad { float grad[]; };
+layout(binding = 3) writeonly buffer BufferLoss { float loss_rows[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint cols;
+    uint valid_rows;  // number of rows with valid targets (for mean reduction)
+} params;
+
+shared float s_max[LOCAL_SIZE_X];
+shared float s_sum[LOCAL_SIZE_X];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint local_size = gl_WorkGroupSize.x;
+
+    if (row >= params.rows) return;
+
+    uint row_off = row * params.cols;
+
+    // Max for stability
+    float local_max = -3.4e38;
+    for (uint c = tid; c < params.cols; c += local_size) {
+        local_max = max(local_max, logits[row_off + c]);
+    }
+    s_max[tid] = local_max;
+    barrier();
+    for (uint stride = local_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_max[tid] = max(s_max[tid], s_max[tid + stride]);
+        barrier();
+    }
+    float row_max = s_max[0];
+    barrier();
+
+    // Sum exp
+    float local_sum = 0.0;
+    for (uint c = tid; c < params.cols; c += local_size) {
+        local_sum += exp(logits[row_off + c] - row_max);
+    }
+    s_sum[tid] = local_sum;
+    barrier();
+    for (uint stride = local_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_sum[tid] += s_sum[tid + stride];
+        barrier();
+    }
+    float row_sum = s_sum[0];
+    barrier();
+
+    float inv_sum = 1.0 / row_sum;
+    uint target = targets[row];
+
+    // Loss (single thread)
+    // If target >= cols (e.g., background class), output loss=0 (no supervision for this row)
+    if (tid == 0) {
+        float row_loss = 0.0;
+        if (target < params.cols) {
+            float tlogit = logits[row_off + target];
+            float log_prob = (tlogit - row_max) - log(row_sum);
+            row_loss = -log_prob;
+        }
+        loss_rows[row] = row_loss;
+    }
+
+    // Gradient = (softmax - one_hot) / valid_rows  (MEAN over valid targets only)
+    // If target is out of bounds, zero gradient for this row
+    float scale = (params.valid_rows > 0) ? (1.0 / float(params.valid_rows)) : 0.0;
+    bool valid_target = (target < params.cols);
+    for (uint c = tid; c < params.cols; c += local_size) {
+        float g = 0.0;
+        if (valid_target) {
+            float p = exp(logits[row_off + c] - row_max) * inv_sum;
+            g = p;
+            if (c == target) g -= 1.0;
+            g *= scale;
+        }
+        grad[row_off + c] = g;
+    }
+}

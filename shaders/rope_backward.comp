@@ -1,0 +1,60 @@
+#version 450
+
+// RoPE backward (inverse rotation)
+//
+// Forward applies:
+//   out0 = x0*cos - x1*sin
+//   out1 = x0*sin + x1*cos
+//
+// Backward needs grad_x = R^T * grad_out (inverse rotation):
+//   grad_x0 = grad_out0*cos + grad_out1*sin
+//   grad_x1 = -grad_out0*sin + grad_out1*cos
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer BufferIn { float grad_in[]; };
+layout(binding = 1) writeonly buffer BufferOut { float grad_out[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint num_heads;
+    uint head_dim;
+    float rope_theta;
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    uint total_pairs = params.seq_len * params.num_heads * (params.head_dim / 2);
+    if (idx >= total_pairs) return;
+
+    uint pairs_per_head = params.head_dim / 2;
+    uint pairs_per_pos = params.num_heads * pairs_per_head;
+
+    uint pos = idx / pairs_per_pos;
+    uint remainder = idx % pairs_per_pos;
+    uint head = remainder / pairs_per_head;
+    uint pair_idx = remainder % pairs_per_head;
+
+    float exponent = float(2 * pair_idx) / float(params.head_dim);
+    float inv_freq = 1.0 / pow(params.rope_theta, exponent);
+
+    float angle = float(pos) * inv_freq;
+    float c = cos(angle);
+    float s = sin(angle);
+
+    uint base_idx = pos * params.num_heads * params.head_dim + head * params.head_dim;
+    uint i0 = base_idx + 2 * pair_idx;
+    uint i1 = base_idx + 2 * pair_idx + 1;
+
+    float g0 = grad_in[i0];
+    float g1 = grad_in[i1];
+
+    float x0 = g0 * c + g1 * s;
+    float x1 = -g0 * s + g1 * c;
+
+    grad_out[i0] = x0;
+    grad_out[i1] = x1;
+}
+

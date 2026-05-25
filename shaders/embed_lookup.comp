@@ -1,0 +1,40 @@
+#version 450
+
+// Embedding lookup
+//
+// tokens: [seq_len] uint32 indices
+// embed:  [vocab_size, hidden_size] float row-major
+// out:    [seq_len, hidden_size] float row-major
+// The vocab_size here is a safety check if a garbage token value
+// exceeds vocab bounds, Vulkan outputs 0.0 instead of reading garbage memory
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer BufferTokens { uint tokens[]; };
+layout(binding = 1) readonly buffer BufferEmbed { float embed[]; };
+layout(binding = 2) writeonly buffer BufferOut { float out_hidden[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint hidden_size;
+    uint vocab_size;
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = params.seq_len * params.hidden_size;
+    if (idx >= total) return;
+
+    uint pos = idx / params.hidden_size;
+    uint dim = idx - pos * params.hidden_size;
+
+    uint token = tokens[pos];
+    if (token >= params.vocab_size) {
+        out_hidden[idx] = 0.0;
+        return;
+    }
+
+    out_hidden[idx] = embed[token * params.hidden_size + dim];
+}
+

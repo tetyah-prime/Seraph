@@ -1,0 +1,202 @@
+#version 450
+
+// Streaming causal multi-head attention backward (no fixed max seq_len).
+// CAS-based float atomic add (no GL_EXT_shader_atomic_float needed)
+// Three-pass online softmax; all FP32 for simplicity and speed.
+// Dispatch: (num_heads, seq_len, 1)
+// local_size_x set via specialization constant (subgroup_size from hardware query)
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer BufferQ { float Q[]; };        // [seq, num_heads*head_dim]
+layout(binding = 1) readonly buffer BufferK { float K[]; };        // [seq, kv_heads*head_dim]
+layout(binding = 2) readonly buffer BufferV { float V[]; };        // [seq, kv_heads*head_dim]
+layout(binding = 3) readonly buffer BufferGradOut { float dO[]; }; // [seq, num_heads*head_dim]
+
+layout(binding = 4) writeonly buffer BufferGradQ { float dQ[]; };  // [seq, num_heads*head_dim]
+layout(binding = 5) coherent buffer BufferGradK { uint dK[]; };    // [seq, kv_heads*head_dim] (CAS)
+layout(binding = 6) coherent buffer BufferGradV { uint dV[]; };    // [seq, kv_heads*head_dim] (CAS)
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint num_heads;
+    uint kv_heads;
+    uint head_dim;
+    float scale;      // should be 1.0 / sqrt(head_dim)
+} params;
+
+shared float s_red[LOCAL_SIZE_X];
+shared float s_m;
+shared float s_l;
+shared float s_weighted_sum;
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint qpos = gl_WorkGroupID.y;
+    uint tid  = gl_LocalInvocationID.x;
+    uint num_threads = gl_WorkGroupSize.x;
+
+    if (head >= params.num_heads || qpos >= params.seq_len) return;
+
+    uint kv_head = head * params.kv_heads / params.num_heads;
+    uint attend_len = qpos + 1;
+    uint q_off = qpos * params.num_heads * params.head_dim + head * params.head_dim;
+
+    // Pass 1: online softmax m,l
+    float m = -1e30;
+    float l = 0.0;
+    const uint BLOCK = gl_WorkGroupSize.x;
+    for (uint base = 0; base < attend_len; base += BLOCK) {
+        uint end = min(attend_len, base + BLOCK);
+
+        float local_max = -1e30;
+        for (uint j = base + tid; j < end; j += num_threads) {
+            uint k_off = j * params.kv_heads * params.head_dim + kv_head * params.head_dim;
+            float score = 0.0;
+            for (uint kk = 0; kk < params.head_dim; kk++) {
+                score += Q[q_off + kk] * K[k_off + kk];
+            }
+            score *= params.scale;
+            local_max = max(local_max, score);
+        }
+
+        s_red[tid] = local_max;
+        barrier();
+        for (uint stride = num_threads / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) s_red[tid] = max(s_red[tid], s_red[tid + stride]);
+            barrier();
+        }
+        if (tid == 0) s_m = s_red[0];
+        barrier();
+        float block_max = s_m;
+
+        float local_sum = 0.0;
+        for (uint j = base + tid; j < end; j += num_threads) {
+            uint k_off = j * params.kv_heads * params.head_dim + kv_head * params.head_dim;
+            float score = 0.0;
+            for (uint kk = 0; kk < params.head_dim; kk++) {
+                score += Q[q_off + kk] * K[k_off + kk];
+            }
+            score *= params.scale;
+            local_sum += exp(score - block_max);
+        }
+
+        s_red[tid] = local_sum;
+        barrier();
+        for (uint stride = num_threads / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) s_red[tid] += s_red[tid + stride];
+            barrier();
+        }
+        if (tid == 0) s_l = s_red[0];
+        barrier();
+        float block_sum = s_l;
+
+        float m_new = max(m, block_max);
+        float alpha = exp(m - m_new);
+        float beta  = exp(block_max - m_new);
+        float l_new = alpha * l + beta * block_sum;
+
+        m = m_new;
+        l = l_new;
+        barrier();
+    }
+
+    float m_final = m;
+    float l_final = max(1e-20, l);
+
+    // Pass 2: weighted_sum and dV
+    float local_wsum = 0.0;
+    for (uint j = tid; j < attend_len; j += num_threads) {
+        uint k_off = j * params.kv_heads * params.head_dim + kv_head * params.head_dim;
+        float score = 0.0;
+        for (uint kk = 0; kk < params.head_dim; kk++) {
+            score += Q[q_off + kk] * K[k_off + kk];
+        }
+        score *= params.scale;
+        float p = exp(score - m_final) / l_final;
+
+        float dP = 0.0;
+        for (uint d = 0; d < params.head_dim; d++) {
+            float go = dO[q_off + d];
+            float vv = V[k_off + d];
+            dP += go * vv;
+            // CAS loop: float atomic add for dV
+            {
+                float fval = p * go;
+                uint addr = k_off + d;
+                uint expected = dV[addr];
+                while (true) {
+                    uint desired = floatBitsToUint(uintBitsToFloat(expected) + fval);
+                    uint old = atomicCompSwap(dV[addr], expected, desired);
+                    if (old == expected) break;
+                    expected = old;
+                }
+            }
+        }
+        local_wsum += p * dP;
+    }
+
+    s_red[tid] = local_wsum;
+    barrier();
+    for (uint stride = num_threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_red[tid] += s_red[tid + stride];
+        barrier();
+    }
+    if (tid == 0) s_weighted_sum = s_red[0];
+    barrier();
+    float weighted_sum = s_weighted_sum;
+
+    // Pass 3: dQ (write) and dK (atomic)
+    for (uint d = tid; d < params.head_dim; d += num_threads) {
+        float acc = 0.0;
+        for (uint j = 0; j < attend_len; j++) {
+            uint k_off = j * params.kv_heads * params.head_dim + kv_head * params.head_dim;
+            float score = 0.0;
+            for (uint kk = 0; kk < params.head_dim; kk++) {
+                score += Q[q_off + kk] * K[k_off + kk];
+            }
+            score *= params.scale;
+            float p = exp(score - m_final) / l_final;
+
+            float dP = 0.0;
+            for (uint dd = 0; dd < params.head_dim; dd++) {
+                dP += dO[q_off + dd] * V[k_off + dd];
+            }
+            float dS = p * (dP - weighted_sum);
+            acc += dS * K[k_off + d];
+        }
+        dQ[q_off + d] = acc * params.scale;
+    }
+
+    for (uint j = tid; j < attend_len; j += num_threads) {
+        uint k_off = j * params.kv_heads * params.head_dim + kv_head * params.head_dim;
+        float score = 0.0;
+        for (uint kk = 0; kk < params.head_dim; kk++) {
+            score += Q[q_off + kk] * K[k_off + kk];
+        }
+        score *= params.scale;
+        float p = exp(score - m_final) / l_final;
+
+        float dP = 0.0;
+        for (uint dd = 0; dd < params.head_dim; dd++) {
+            dP += dO[q_off + dd] * V[k_off + dd];
+        }
+        float dS = p * (dP - weighted_sum);
+
+        for (uint d = 0; d < params.head_dim; d++) {
+            // CAS loop: float atomic add for dK
+            {
+                float fval = (dS * params.scale) * Q[q_off + d];
+                uint addr = k_off + d;
+                uint expected = dK[addr];
+                while (true) {
+                    uint desired = floatBitsToUint(uintBitsToFloat(expected) + fval);
+                    uint old = atomicCompSwap(dK[addr], expected, desired);
+                    if (old == expected) break;
+                    expected = old;
+                }
+            }
+        }
+    }
+}

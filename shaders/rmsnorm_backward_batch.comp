@@ -1,0 +1,100 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64    : require
+// CAS-based float atomic add (no GL_EXT_shader_atomic_float needed)
+
+// RMSNorm backward (batched rows)
+//
+// Forward (per row):
+//   rms = sqrt(mean(x^2) + eps)
+//   y[i] = x[i] / rms * scale[i]
+//
+// Backward:
+//   grad_scale[i] += sum_rows( grad_y[row,i] * x[row,i] / rms[row] )
+//   grad_x[row,i] = grad_y[row,i] * scale[i] / rms[row]
+//                  - x[row,i] * (sum_j(grad_y[row,j] * scale[j] * x[row,j])) / (rms[row]^3 * cols)
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer BufferInput { float x[]; };          // [rows, cols]
+layout(binding = 1) readonly buffer BufferScale { float scale[]; };      // [cols]
+layout(binding = 2) readonly buffer BufferGradY { float grad_y[]; };     // [rows, cols]
+layout(binding = 3) buffer BufferGradX { float grad_x[]; };              // [rows, cols]
+layout(binding = 4) coherent buffer BufferGradScale { uint grad_scale[]; }; // [cols] (accum via CAS)
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint cols;
+    float eps;
+} params;
+
+shared double s_sum_sq[LOCAL_SIZE_X];
+shared double s_sum_coupled[LOCAL_SIZE_X];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint local_size = gl_WorkGroupSize.x;
+
+    if (row >= params.rows) return;
+
+    uint row_off = row * params.cols;
+
+    // Compute sum(x^2) for this row
+    double local_sq = 0.0;
+    for (uint c = tid; c < params.cols; c += local_size) {
+        float xv = x[row_off + c];
+        local_sq += double(xv) * double(xv);
+    }
+    s_sum_sq[tid] = local_sq;
+    barrier();
+    for (uint stride = local_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_sum_sq[tid] += s_sum_sq[tid + stride];
+        barrier();
+    }
+
+    double mean_sq = s_sum_sq[0] / max(1.0, double(params.cols));
+    double rms = sqrt(mean_sq + double(params.eps));
+    // Clamp RMS floor to prevent inv_rms³ from overflowing FP32 on write-back
+    rms = max(rms, 0.01);
+    double inv_rms = 1.0 / rms;
+    double inv_rms3 = inv_rms * inv_rms * inv_rms;
+
+    // Compute coupled term: sum_j(grad_y * scale * x) — NO divide during accumulation
+    // Match CUDA: accumulate full sum, divide by cols at END
+    double local_c = 0.0;
+    for (uint c = tid; c < params.cols; c += local_size) {
+        float gy = grad_y[row_off + c];
+        float s = scale[c];
+        float xv = x[row_off + c];
+        local_c += double(gy) * double(s) * double(xv);
+    }
+    s_sum_coupled[tid] = local_c;
+    barrier();
+    for (uint stride = local_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_sum_coupled[tid] += s_sum_coupled[tid + stride];
+        barrier();
+    }
+    // Divide at END (matches CUDA FP rounding path)
+    double coupled = s_sum_coupled[0] / max(1.0, double(params.cols));
+
+    // Write grad_x and accumulate grad_scale
+    for (uint c = tid; c < params.cols; c += local_size) {
+        float gy = grad_y[row_off + c];
+        float s = scale[c];
+        float xv = x[row_off + c];
+
+        // CAS loop: float atomic add for grad_scale
+        {
+            float fval = float(double(gy) * double(xv) * inv_rms);
+            uint expected = grad_scale[c];
+            while (true) {
+                uint desired = floatBitsToUint(uintBitsToFloat(expected) + fval);
+                uint old = atomicCompSwap(grad_scale[c], expected, desired);
+                if (old == expected) break;
+                expected = old;
+            }
+        }
+        grad_x[row_off + c] = float(double(gy) * double(s) * inv_rms - double(xv) * (coupled * inv_rms3));
+    }
+}

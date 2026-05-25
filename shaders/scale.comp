@@ -1,0 +1,19 @@
+#version 450
+
+// In-place scale: data[i] *= alpha
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) buffer BufferData { float data[]; };
+
+layout(push_constant) uniform PushConstants {
+    float alpha;
+    uint count;
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.count) return;
+    data[idx] *= params.alpha;
+}

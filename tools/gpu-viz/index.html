@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Seraph GPU Visualizer</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+</head>
+<body>
+    <div id="app">
+        <header>
+            <div class="header-left">
+                <h1>SERAPH GPU VISUALIZER</h1>
+                <span id="status-badge" class="badge idle">IDLE</span>
+            </div>
+            <div class="header-right">
+                <span id="gpu-name">No GPU detected</span>
+                <span id="gpu-specs"></span>
+                <input type="file" id="wallpaper-file" accept="image/*" style="display:none">
+                <button id="btn-wallpaper" style="flex:0;padding:2px 8px;font-size:9px">BG</button>
+                <button id="btn-wallpaper-clear" style="flex:0;padding:2px 6px;font-size:9px">✕</button>
+            </div>
+        </header>
+
+        <div id="main">
+            <aside id="sidebar">
+                <!-- Training controls -->
+                <section>
+                    <h2>Training</h2>
+                    <label>Model Directory</label>
+                    <div class="path-row">
+                        <input id="in-model" type="text" placeholder="/path/to/model" spellcheck="false">
+                        <button class="path-btn" data-target="in-model" data-pick="dir" title="Browse">...</button>
+                    </div>
+                    <label>Training Data</label>
+                    <div class="path-row">
+                        <input id="in-data" type="text" placeholder="/path/to/data.ttok" spellcheck="false">
+                        <button class="path-btn" data-target="in-data" data-pick="file" title="Browse">...</button>
+                    </div>
+
+                    <label>Mode</label>
+                    <div id="flag-toggles">
+                        <button class="flag-btn" data-flag="--full-training">full</button>
+                        <button class="flag-btn" data-flag="--bf16">bf16</button>
+                        <button class="flag-btn" data-flag="--flash">flash</button>
+                        <button class="flag-btn" data-flag="--fixed-seq">fixed-seq</button>
+                    </div>
+                    <label>Debug</label>
+                    <div id="flag-toggles-debug">
+                        <button class="flag-btn" data-flag="--debug">debug</button>
+                        <button class="flag-btn" data-flag="--debug-nan-check">nan-check</button>
+                        <button class="flag-btn" data-flag="--debug-weight-delta">w-delta</button>
+                    </div>
+
+                    <label>Learning Rate</label>
+                    <input id="in-lr" type="text" placeholder="3.14e-4" spellcheck="false">
+                    <label>Epochs</label>
+                    <input id="in-epochs" type="text" placeholder="100" spellcheck="false">
+                    <label>Max Seq</label>
+                    <input id="in-maxseq" type="text" placeholder="512" spellcheck="false">
+                    <label>Batch</label>
+                    <input id="in-batch" type="text" placeholder="1" spellcheck="false">
+                    <label>Grad Accum</label>
+                    <input id="in-accum" type="text" placeholder="1" spellcheck="false">
+                    <label>Save Every</label>
+                    <input id="in-save" type="text" placeholder="1000" spellcheck="false">
+                    <label>Log Every</label>
+                    <input id="in-log" type="text" placeholder="100" spellcheck="false">
+                    <label>Snapshot Every</label>
+                    <input id="in-snapshot" type="text" placeholder="" spellcheck="false">
+                    <label>Checkpoint Dir</label>
+                    <div class="path-row">
+                        <input id="in-checkpoint" type="text" placeholder="./checkpoints" spellcheck="false">
+                        <button class="path-btn" data-target="in-checkpoint" data-pick="dir" title="Browse">...</button>
+                    </div>
+                    <label>GPU Device</label>
+                    <input id="in-gpu-device" type="text" placeholder="0" spellcheck="false">
+                    <label>LoRA Rank</label>
+                    <input id="in-lora-rank" type="text" placeholder="8" spellcheck="false">
+                    <label>LoRA Alpha</label>
+                    <input id="in-lora-alpha" type="text" placeholder="16.0" spellcheck="false">
+                    <label>Resume Checkpoint</label>
+                    <div class="path-row">
+                        <input id="in-resume" type="text" placeholder="/path/to/checkpoint.bin" spellcheck="false">
+                        <button class="path-btn" data-target="in-resume" data-pick="file" title="Browse">...</button>
+                    </div>
+                    <label>Extra Flags</label>
+                    <input id="in-flags" type="text" placeholder="" spellcheck="false">
+
+                    <div class="btn-row">
+                        <button id="btn-load" title="Query GPU hardware + model params">Load GPU</button>
+                        <button id="btn-start" class="btn-go">Start</button>
+                        <button id="btn-stop" class="btn-danger" disabled>Stop</button>
+                    </div>
+                </section>
+
+                <!-- Replay -->
+                <section>
+                    <h2>Replay</h2>
+                    <input type="file" id="replay-file" accept=".log,.txt" style="display:none">
+                    <div class="btn-row">
+                        <button id="btn-replay-load">Load profile.log</button>
+                    </div>
+                    <div id="replay-controls" style="display:none;margin-top:8px">
+                        <div class="stat-row"><span class="stat-key">Steps</span><span id="replay-steps" class="stat-val">—</span></div>
+                        <div class="stat-row"><span class="stat-key">Op</span><span id="replay-pos" class="stat-val">—</span></div>
+                        <div id="speed-btns" style="margin-top:6px;display:flex;flex-wrap:wrap;gap:3px">
+                            <button class="flag-btn speed-btn" data-ms="2000">2s</button>
+                            <button class="flag-btn speed-btn" data-ms="1000">1s</button>
+                            <button class="flag-btn speed-btn active" data-ms="500">0.5s</button>
+                            <button class="flag-btn speed-btn" data-ms="200">0.2s</button>
+                            <button class="flag-btn speed-btn" data-ms="100">100ms</button>
+                            <button class="flag-btn speed-btn" data-ms="50">50ms</button>
+                        </div>
+                        <div class="btn-row" style="margin-top:6px">
+                            <button id="btn-replay-play" class="btn-go">Play</button>
+                            <button id="btn-replay-pause">Pause</button>
+                            <button id="btn-replay-reset">Reset</button>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Live status -->
+                <section>
+                    <h2>Status</h2>
+                    <div id="train-status">
+                        <div class="stat-row"><span class="stat-key">Step</span><span id="stat-step" class="stat-val">—</span></div>
+                        <div class="stat-row"><span class="stat-key">Loss</span><span id="stat-loss" class="stat-val">—</span></div>
+                        <div class="stat-row"><span class="stat-key">Tok/s</span><span id="stat-toks" class="stat-val">—</span></div>
+                        <div class="stat-row"><span class="stat-key">Step Time</span><span id="stat-steptime" class="stat-val">—</span></div>
+                        <div class="stat-row"><span class="stat-key">Ops/Step</span><span id="stat-ops" class="stat-val">—</span></div>
+                    </div>
+                </section>
+
+                <!-- Category breakdown -->
+                <section>
+                    <h2>Breakdown</h2>
+                    <div id="cat-bars"></div>
+                </section>
+
+                <!-- Hardware info -->
+                <section id="hw-section" style="display:none">
+                    <h2>Hardware</h2>
+                    <div id="hw-info"></div>
+                </section>
+
+                <!-- Model info -->
+                <section id="model-section" style="display:none">
+                    <h2>Model</h2>
+                    <div id="model-info"></div>
+                </section>
+
+                <!-- Derived defines -->
+                <section id="defines-section" style="display:none">
+                    <h2>Derived Params</h2>
+                    <div id="defines-info"></div>
+                </section>
+
+                <!-- Selected op detail -->
+                <section>
+                    <h2>Selected Op</h2>
+                    <div id="op-detail">
+                        <span class="hint">Click an operation in the timeline</span>
+                    </div>
+                </section>
+            </aside>
+
+            <div id="canvas-wrap">
+                <canvas id="gpu-canvas"></canvas>
+                <div id="canvas-info">
+                    <span id="zoom-level">1.0x</span>
+                </div>
+                <!-- Terminal output overlay -->
+                <div id="term-wrap" class="term-open">
+                    <div id="term-header">
+                        <span>Terminal</span>
+                        <button id="term-toggle">_</button>
+                    </div>
+                    <pre id="term-output"></pre>
+                </div>
+            </div>
+        </div>
+
+        <div id="timeline-wrap">
+            <canvas id="timeline"></canvas>
+        </div>
+
+        <!-- Log output (collapsible) -->
+        <div id="log-wrap">
+            <div id="log-toggle">Output <span id="log-count">0</span></div>
+            <pre id="log-output"></pre>
+        </div>
+    </div>
+
+    <!-- File browser modal -->
+    <div id="browser-overlay" class="overlay hidden">
+        <div id="browser-modal">
+            <div id="browser-header">
+                <span id="browser-title">Browse</span>
+                <button id="browser-close">X</button>
+            </div>
+            <div id="browser-path-bar">
+                <input id="browser-path" type="text" spellcheck="false">
+                <button id="browser-go">Go</button>
+            </div>
+            <div id="browser-list"></div>
+            <div id="browser-footer">
+                <button id="browser-select" class="btn-go">Select</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="parser.js"></script>
+    <script src="renderer.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>

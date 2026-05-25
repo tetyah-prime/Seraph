@@ -1,0 +1,45 @@
+#version 450
+
+// Embedding backward (scatter-add)
+// CAS-based float atomic add (no GL_EXT_shader_atomic_float needed)
+//
+// tokens: [seq_len] uint
+// grad_hidden: [seq_len, hidden_size] float
+// grad_embed: [vocab_size, hidden_size] uint (accum via CAS)
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer BufferTokens { uint tokens[]; };
+layout(binding = 1) readonly buffer BufferGradHidden { float grad_hidden[]; };
+layout(binding = 2) coherent buffer BufferGradEmbed { uint grad_embed[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint hidden_size;
+    uint vocab_size;
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = params.seq_len * params.hidden_size;
+    if (idx >= total) return;
+
+    uint pos = idx / params.hidden_size;
+    uint h = idx - pos * params.hidden_size;
+
+    uint token = tokens[pos];
+    if (token >= params.vocab_size) return;
+
+    float g = grad_hidden[idx];
+
+    // CAS loop: float atomic add
+    uint addr = token * params.hidden_size + h;
+    uint expected = grad_embed[addr];
+    while (true) {
+        uint desired = floatBitsToUint(uintBitsToFloat(expected) + g);
+        uint old = atomicCompSwap(grad_embed[addr], expected, desired);
+        if (old == expected) break;
+        expected = old;
+    }
+}
+

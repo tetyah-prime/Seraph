@@ -1,0 +1,865 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Seraph Tensor Viewer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0a0f; color: #e0e0e0; font-family: 'Courier New', monospace; overflow-x: hidden; }
+.header { background: #111118; padding: 12px 20px; border-bottom: 1px solid #2a2a3a; display: flex; align-items: center; gap: 20px; }
+.header h1 { font-size: 16px; color: #8888ff; }
+.header .status { font-size: 12px; color: #666; }
+.header .loss { font-size: 14px; color: #ff8844; font-weight: bold; }
+.controls { background: #0f0f18; padding: 8px 20px; border-bottom: 1px solid #1a1a2a; display: flex; gap: 15px; align-items: center; flex-wrap: wrap; }
+.controls label { font-size: 11px; color: #888; }
+.controls select, .controls input { background: #1a1a28; color: #ddd; border: 1px solid #333; padding: 4px 8px; font-family: inherit; font-size: 11px; border-radius: 3px; }
+.controls button { background: #2a2a5a; color: #aaf; border: 1px solid #444; padding: 4px 12px; cursor: pointer; font-family: inherit; font-size: 11px; border-radius: 3px; }
+.controls button:hover { background: #3a3a7a; }
+.controls button.active { background: #4a4a8a; border-color: #88f; }
+
+.main { display: flex; height: calc(100vh - 120px); }
+.sidebar { width: 220px; background: #0d0d14; border-right: 1px solid #1a1a2a; overflow-y: auto; padding: 10px; }
+.sidebar h3 { font-size: 11px; color: #666; text-transform: uppercase; margin: 10px 0 5px; }
+.sidebar .tensor-item { padding: 4px 8px; cursor: pointer; font-size: 11px; color: #aaa; border-radius: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sidebar .tensor-item:hover { background: #1a1a2a; color: #fff; }
+.sidebar .tensor-item.selected { background: #2a2a5a; color: #aaf; }
+
+.viewport-wrap { flex: 1; overflow: hidden; position: relative; background-size: contain; background-position: center; background-repeat: no-repeat; }
+.viewport { padding: 20px; display: flex; flex-wrap: wrap; gap: 20px; align-content: start; align-items: start; }
+.tensor-card { background: #111118; border: 1px solid #2a2a3a; border-radius: 6px; overflow: hidden; width: fit-content; }
+.tensor-card .card-header { padding: 8px 12px; background: #15151f; border-bottom: 1px solid #2a2a3a; display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+.tensor-card .card-title { font-size: 12px; color: #8888ff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tensor-card .card-dims { font-size: 10px; color: #666; white-space: nowrap; flex-shrink: 0; }
+.tensor-card .card-stats { padding: 4px 12px; font-size: 10px; color: #888; background: #0d0d14; display: flex; gap: 12px; }
+.tensor-card canvas { display: block; image-rendering: pixelated; }
+
+.tooltip { position: fixed; background: #1a1a28; border: 1px solid #444; padding: 6px 10px; font-size: 11px; color: #ddd; pointer-events: none; z-index: 1000; border-radius: 4px; display: none; }
+
+/* Step timeline at bottom */
+.timeline { position: fixed; bottom: 0; left: 0; right: 0; height: 40px; background: #0d0d14; border-top: 1px solid #2a2a3a; display: flex; align-items: center; padding: 0 20px; gap: 10px; }
+.timeline input[type=range] { flex: 1; accent-color: #8888ff; }
+.timeline .step-label { font-size: 12px; color: #888; min-width: 100px; }
+
+/* Color scale legend */
+.legend { display: flex; align-items: center; gap: 5px; font-size: 10px; color: #666; padding: 4px 12px; }
+.legend-bar canvas { border-radius: 2px; display: block; }
+</style>
+</head>
+<body>
+
+<div class="header">
+    <h1>SERAPH TENSOR VIEWER</h1>
+    <span class="status" id="status">No data loaded</span>
+    <span class="loss" id="loss-display"></span>
+    <input type="file" id="wallpaper-file" accept="image/*" style="display:none">
+    <button id="btn-wallpaper" style="padding:2px 8px;font-size:9px;background:#1a1a28;color:#888;border:1px solid #333;border-radius:3px;cursor:pointer">BG</button>
+    <button id="btn-wallpaper-clear" style="padding:2px 6px;font-size:9px;background:#1a1a28;color:#888;border:1px solid #333;border-radius:3px;cursor:pointer">✕</button>
+</div>
+
+<div class="controls">
+    <label>Colormap:
+        <select id="colormap">
+            <option value="plasma">Plasma</option>
+            <option value="viridis">Viridis</option>
+            <option value="diverging" selected>Diverging (blue-red)</option>
+            <option value="grayscale">Grayscale</option>
+        </select>
+    </label>
+    <label>Scale:
+        <select id="scale-mode">
+            <option value="auto">Auto (per-tensor)</option>
+            <option value="symmetric">Symmetric</option>
+            <option value="global">Global</option>
+        </select>
+    </label>
+    <label>Max cells:
+        <input type="number" id="max-cells" value="256" min="32" max="2048" step="32">
+    </label>
+    <button id="btn-load">Load Files</button>
+    <button id="btn-compare">Compare</button>
+    <button id="btn-clear-compare" style="display:none">Clear</button>
+    <span id="snapshot-count" style="font-size:10px;color:#666"></span>
+</div>
+
+<div class="main">
+    <div class="sidebar" id="sidebar">
+        <h3>Tensors</h3>
+        <div id="tensor-list"></div>
+    </div>
+    <div class="viewport-wrap">
+        <div class="viewport" id="viewport"></div>
+    </div>
+</div>
+
+<div class="timeline">
+    <span class="step-label" id="step-label">Step: —</span>
+    <input type="range" id="step-slider" min="0" max="0" value="0">
+    <button id="btn-play" style="padding:2px 10px;font-size:11px">▶</button>
+    <button id="btn-load-dir" style="padding:2px 10px;font-size:11px">Load Dir</button>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+// SERAPH TENSOR VIEWER - Client-side binary tensor renderer
+// ═══════════════════════════════════════════════════════════════════════════
+
+const MAGIC = 'SRPH';
+
+// Colormaps
+const COLORMAPS = {
+    plasma: (t) => {
+        const r = Math.min(255, Math.max(0, Math.round(255 * (0.05 + 0.95 * Math.pow(t, 0.5)))));
+        const g = Math.min(255, Math.max(0, Math.round(255 * (t < 0.5 ? t * 1.2 : 0.6 + 0.4 * (1 - t)))));
+        const b = Math.min(255, Math.max(0, Math.round(255 * (t < 0.3 ? 0.5 + t : 0.8 - 0.8 * t))));
+        return [r, g, b];
+    },
+    viridis: (t) => {
+        const r = Math.round(255 * (0.267 + t * (0.993 - 0.267)));
+        const g = Math.round(255 * (0.004 + t * (0.906 - 0.004)));
+        const b = Math.round(255 * (0.329 + (t < 0.5 ? t * 0.7 : 0.35 - (t - 0.5) * 0.7)));
+        return [Math.min(255, r), Math.min(255, g), Math.min(255, b)];
+    },
+    diverging: (t) => {
+        // Blue (0) -> White (0.5) -> Red (1)
+        if (t < 0.5) {
+            const s = t * 2;
+            return [Math.round(s * 255), Math.round(s * 255), 255];
+        } else {
+            const s = (t - 0.5) * 2;
+            return [255, Math.round((1 - s) * 255), Math.round((1 - s) * 255)];
+        }
+    },
+    grayscale: (t) => {
+        const v = Math.round(t * 255);
+        return [v, v, v];
+    }
+};
+
+// State
+let snapshots = [];     // [{name, tensors: {key -> {header, data, stats}}}]
+let tensors = {};       // current/first snapshot tensors (for sidebar)
+let manifest = null;
+let selectedTensors = new Set();
+let compareMode = false;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BINARY PARSER
+// ═══════════════════════════════════════════════════════════════════════════
+
+function parseTensorFile(buffer) {
+    const view = new DataView(buffer);
+    const magic = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
+    if (magic !== MAGIC) throw new Error('Invalid magic: ' + magic);
+
+    const version = view.getUint32(4, true);
+    const step = view.getUint32(8, true);
+    const layer = view.getInt32(12, true);
+    const rows = view.getUint32(16, true);
+    const cols = view.getUint32(20, true);
+    const nameLen = view.getUint32(24, true);
+
+    const nameBytes = new Uint8Array(buffer, 28, nameLen);
+    const name = new TextDecoder().decode(nameBytes);
+
+    const dataOffset = 28 + nameLen;
+    const data = new Float32Array(buffer, dataOffset, rows * cols);
+
+    // Compute stats
+    let min = Infinity, max = -Infinity, sum = 0, sumSq = 0;
+    let nanCount = 0, infCount = 0;
+    for (let i = 0; i < data.length; i++) {
+        const v = data[i];
+        if (isNaN(v)) { nanCount++; continue; }
+        if (!isFinite(v)) { infCount++; continue; }
+        if (v < min) min = v;
+        if (v > max) max = v;
+        sum += v;
+        sumSq += v * v;
+    }
+    const n = data.length - nanCount - infCount;
+    const mean = n > 0 ? sum / n : 0;
+    const variance = n > 0 ? sumSq / n - mean * mean : 0;
+    const std = Math.sqrt(Math.max(0, variance));
+
+    return {
+        header: { version, step, layer, rows, cols, name },
+        data,
+        stats: { min, max, mean, std, nanCount, infCount, n }
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RENDERING
+// ═══════════════════════════════════════════════════════════════════════════
+
+function renderTensor(tensor, canvasWidth) {
+    const { header, data, stats } = tensor;
+    const { rows, cols } = header;
+    const maxCells = parseInt(document.getElementById('max-cells').value) || 256;
+    const colormapName = document.getElementById('colormap').value;
+    const scaleMode = document.getElementById('scale-mode').value;
+    const colormap = COLORMAPS[colormapName] || COLORMAPS.diverging;
+
+    // Subsample if too large
+    const stepR = Math.max(1, Math.ceil(rows / maxCells));
+    const stepC = Math.max(1, Math.ceil(cols / maxCells));
+    const dispRows = Math.ceil(rows / stepR);
+    const dispCols = Math.ceil(cols / stepC);
+
+    // Determine pixel size
+    const maxPx = canvasWidth || 500;
+    const cellSize = Math.max(1, Math.min(8, Math.floor(maxPx / dispCols)));
+    const w = dispCols * cellSize;
+    const h = dispRows * cellSize;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    const imgData = ctx.createImageData(w, h);
+
+    // Scale
+    let vmin = stats.min, vmax = stats.max;
+    if (scaleMode === 'symmetric') {
+        const absMax = Math.max(Math.abs(vmin), Math.abs(vmax));
+        vmin = -absMax;
+        vmax = absMax;
+    }
+    const range = vmax - vmin;
+    const invRange = range > 0 ? 1.0 / range : 1.0;
+
+    for (let dr = 0; dr < dispRows; dr++) {
+        const srcR = dr * stepR;
+        for (let dc = 0; dc < dispCols; dc++) {
+            const srcC = dc * stepC;
+
+            // Average over subsampled block
+            let val = 0, count = 0;
+            for (let r = srcR; r < Math.min(rows, srcR + stepR); r++) {
+                for (let c = srcC; c < Math.min(cols, srcC + stepC); c++) {
+                    const v = data[r * cols + c];
+                    if (!isNaN(v) && isFinite(v)) { val += v; count++; }
+                }
+            }
+            val = count > 0 ? val / count : 0;
+
+            const t = Math.max(0, Math.min(1, (val - vmin) * invRange));
+            const [cr, cg, cb] = colormap(t);
+
+            // Fill cell
+            for (let py = 0; py < cellSize; py++) {
+                for (let px = 0; px < cellSize; px++) {
+                    const idx = ((dr * cellSize + py) * w + (dc * cellSize + px)) * 4;
+                    imgData.data[idx] = cr;
+                    imgData.data[idx + 1] = cg;
+                    imgData.data[idx + 2] = cb;
+                    imgData.data[idx + 3] = 255;
+                }
+            }
+        }
+    }
+
+    ctx.putImageData(imgData, 0, 0);
+
+    // Store metadata on canvas for tooltip
+    canvas.dataset.rows = rows;
+    canvas.dataset.cols = cols;
+    canvas.dataset.stepR = stepR;
+    canvas.dataset.stepC = stepC;
+    canvas.dataset.cellSize = cellSize;
+    canvas.dataset.tensorName = header.name;
+    canvas._tensorData = data;
+    canvas._vmin = vmin;
+    canvas._vmax = vmax;
+
+    return canvas;
+}
+
+function createTensorCard(tensor) {
+    const { header, stats } = tensor;
+    const card = document.createElement('div');
+    card.className = 'tensor-card';
+
+    const hdr = document.createElement('div');
+    hdr.className = 'card-header';
+
+    const title = document.createElement('span');
+    title.className = 'card-title';
+    title.textContent = header.layer >= 0 ? `L${header.layer} ${header.name}` : header.name;
+
+    const dims = document.createElement('span');
+    dims.className = 'card-dims';
+    dims.textContent = `${header.rows} x ${header.cols}`;
+
+    hdr.appendChild(title);
+    hdr.appendChild(dims);
+    card.appendChild(hdr);
+
+    // Render heatmap
+    const canvas = renderTensor(tensor, 400);
+    card.appendChild(canvas);
+
+    // Stats bar
+    const statsDiv = document.createElement('div');
+    statsDiv.className = 'card-stats';
+    statsDiv.innerHTML = `
+        <span>min: ${stats.min.toFixed(4)}</span>
+        <span>max: ${stats.max.toFixed(4)}</span>
+        <span>mean: ${stats.mean.toFixed(4)}</span>
+        <span>std: ${stats.std.toFixed(4)}</span>
+        ${stats.nanCount > 0 ? `<span style="color:#f44">NaN: ${stats.nanCount}</span>` : ''}
+    `;
+    card.appendChild(statsDiv);
+
+    // Legend
+    const legend = document.createElement('div');
+    legend.className = 'legend';
+    const colormapName = document.getElementById('colormap').value;
+    const cmap = COLORMAPS[colormapName] || COLORMAPS.diverging;
+    const barCanvas = document.createElement('canvas');
+    barCanvas.width = 120; barCanvas.height = 10;
+    const barCtx = barCanvas.getContext('2d');
+    const barImg = barCtx.createImageData(120, 10);
+    for (let x = 0; x < 120; x++) {
+        const [r, g, b] = cmap(x / 119);
+        for (let y = 0; y < 10; y++) {
+            const i = (y * 120 + x) * 4;
+            barImg.data[i] = r; barImg.data[i+1] = g; barImg.data[i+2] = b; barImg.data[i+3] = 255;
+        }
+    }
+    barCtx.putImageData(barImg, 0, 0);
+    // Mean marker
+    const range = stats.max - stats.min;
+    if (range > 0) {
+        const meanX = Math.round(((stats.mean - stats.min) / range) * 119);
+        barCtx.fillStyle = '#fff';
+        barCtx.fillRect(meanX, 0, 1, 10);
+        barCtx.fillStyle = '#000';
+        barCtx.fillRect(meanX - 1, 0, 1, 10);
+        barCtx.fillRect(meanX + 1, 0, 1, 10);
+    }
+    const barWrap = document.createElement('div');
+    barWrap.className = 'legend-bar';
+    barWrap.style.position = 'relative';
+    barWrap.appendChild(barCanvas);
+    legend.appendChild(document.createTextNode(stats.min.toFixed(2)));
+    legend.appendChild(barWrap);
+    legend.appendChild(document.createTextNode(stats.max.toFixed(2)));
+    card.appendChild(legend);
+
+    // Tooltip on hover
+    canvas.addEventListener('mousemove', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        const cellSize = parseInt(canvas.dataset.cellSize);
+        const stepR = parseInt(canvas.dataset.stepR);
+        const stepC = parseInt(canvas.dataset.stepC);
+        const cols = parseInt(canvas.dataset.cols);
+        const dc = Math.floor(x / cellSize);
+        const dr = Math.floor(y / cellSize);
+        const srcR = dr * stepR;
+        const srcC = dc * stepC;
+        const val = canvas._tensorData[srcR * cols + srcC];
+
+        const tooltip = document.getElementById('tooltip');
+        tooltip.style.display = 'block';
+        tooltip.style.left = (e.clientX + 15) + 'px';
+        tooltip.style.top = (e.clientY - 10) + 'px';
+        tooltip.textContent = `[${srcR}, ${srcC}] = ${val.toFixed(6)}`;
+    });
+    canvas.addEventListener('mouseleave', () => {
+        document.getElementById('tooltip').style.display = 'none';
+    });
+
+    return card;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FILE LOADING
+// ═══════════════════════════════════════════════════════════════════════════
+
+function handleFiles(files) {
+    if (!compareMode) {
+        snapshots = [];
+        tensors = {};
+    }
+
+    const promises = [];
+
+    for (const file of files) {
+        if (file.name.endsWith('.safetensors')) {
+            promises.push(file.arrayBuffer().then(buf => {
+                const t = parseSafetensors(buf);
+                snapshots.push({ name: file.name, tensors: t });
+            }));
+        } else if (file.name.endsWith('.bin')) {
+            promises.push(file.arrayBuffer().then(buf => {
+                try {
+                    const tensor = parseTensorFile(buf);
+                    const h = tensor.header;
+                    const key = h.layer >= 0 ? `L${h.layer}_${h.name}` : h.name;
+                    if (snapshots.length === 0) snapshots.push({ name: 'bins', tensors: {} });
+                    snapshots[0].tensors[key] = tensor;
+                } catch (e) {
+                    console.error('Parse error:', file.name, e);
+                }
+            }));
+        }
+    }
+
+    Promise.all(promises).then(() => {
+        // Sort snapshots by filename so checkpoints are in order
+        snapshots.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+        // First snapshot owns the sidebar
+        tensors = snapshots[0]?.tensors || {};
+        const total = snapshots.reduce((s, snap) => s + Object.keys(snap.tensors).length, 0);
+        document.getElementById('status').textContent = compareMode && snapshots.length > 1
+            ? `${snapshots.length} snapshots | ${total} tensors`
+            : `${Object.keys(tensors).length} tensors from ${snapshots[0]?.name || 'files'}`;
+        document.getElementById('snapshot-count').textContent = snapshots.length > 1 ? `${snapshots.length} files` : '';
+        updateSidebar();
+        updateViewport();
+    });
+}
+
+// Parse safetensors → returns tensor map (doesn't touch globals)
+function parseSafetensors(buf) {
+    const view = new DataView(buf);
+    const hdrSize = Number(view.getBigUint64(0, true));
+    const hdrJson = new TextDecoder().decode(new Uint8Array(buf, 8, hdrSize));
+    const header = JSON.parse(hdrJson);
+    const dataStart = 8 + hdrSize;
+    const result = {};
+
+    for (const [name, info] of Object.entries(header)) {
+        if (name === '__metadata__') continue;
+        const [offStart, offEnd] = info.data_offsets;
+        const shape = info.shape || [1];
+        const dtype = info.dtype;
+
+        const rows = shape.length >= 2 ? shape[0] : 1;
+        const cols = shape.length >= 2 ? shape[1] : shape[0];
+        const numEl = rows * cols;
+
+        let fp32;
+        if (dtype === 'BF16') {
+            const raw = new Uint16Array(buf.slice(dataStart + offStart, dataStart + offEnd));
+            fp32 = new Float32Array(numEl);
+            const u32 = new Uint32Array(fp32.buffer);
+            for (let i = 0; i < numEl; i++) u32[i] = raw[i] << 16;
+        } else if (dtype === 'F32') {
+            fp32 = new Float32Array(buf.slice(dataStart + offStart, dataStart + offEnd));
+        } else if (dtype === 'F16') {
+            const raw = new Uint16Array(buf.slice(dataStart + offStart, dataStart + offEnd));
+            fp32 = new Float32Array(numEl);
+            for (let i = 0; i < numEl; i++) {
+                const h = raw[i], sign = (h & 0x8000) << 16, exp = (h >> 10) & 0x1F, mant = h & 0x3FF;
+                const bits = exp === 0 ? sign : exp === 31 ? sign | 0x7F800000 | (mant << 13) : sign | ((exp + 112) << 23) | (mant << 13);
+                new DataView(fp32.buffer).setUint32(i * 4, bits, false);
+            }
+        } else continue;
+
+        let min = Infinity, max = -Infinity, sum = 0, sumSq = 0, nanCount = 0, infCount = 0;
+        for (let i = 0; i < fp32.length; i++) {
+            const v = fp32[i];
+            if (isNaN(v)) { nanCount++; continue; }
+            if (!isFinite(v)) { infCount++; continue; }
+            if (v < min) min = v;
+            if (v > max) max = v;
+            sum += v;
+            sumSq += v * v;
+        }
+        const n = fp32.length - nanCount - infCount;
+        const mean = n > 0 ? sum / n : 0;
+        const std = Math.sqrt(Math.max(0, n > 0 ? sumSq / n - mean * mean : 0));
+
+        const lm = name.match(/layers\.(\d+)/);
+        const layer = lm ? parseInt(lm[1]) : -1;
+        const key = layer >= 0 ? `L${layer}_${name}` : name;
+
+        result[key] = {
+            header: { version: 1, step: 0, layer, rows, cols, name },
+            data: fp32,
+            stats: { min, max, mean, std, nanCount, infCount, n }
+        };
+    }
+    return result;
+}
+
+// Drag-drop
+document.addEventListener('dragover', (e) => { e.preventDefault(); });
+document.addEventListener('drop', (e) => {
+    e.preventDefault();
+    if (e.dataTransfer.files.length > 0) {
+        handleFiles(e.dataTransfer.files);
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UI UPDATES
+// ═══════════════════════════════════════════════════════════════════════════
+
+function updateSidebar() {
+    const list = document.getElementById('tensor-list');
+    list.innerHTML = '';
+
+    const keys = Object.keys(tensors);
+
+    // Group: embed → layers → tail (norm/lm_head)
+    const embed = keys.filter(k => !k.startsWith('L') && k.toLowerCase().includes('embed')).sort();
+    const tail = keys.filter(k => !k.startsWith('L') && !k.toLowerCase().includes('embed')).sort();
+    const layers = {};
+    const opOrder = ['input_layernorm', 'q_proj', 'k_proj', 'v_proj', 'o_proj',
+                     'post_attention_layernorm', 'gate_proj', 'up_proj', 'down_proj'];
+    keys.filter(k => k.startsWith('L')).forEach(k => {
+        const m = k.match(/^L(\d+)_/);
+        const l = m ? m[1] : '?';
+        if (!layers[l]) layers[l] = [];
+        layers[l].push(k);
+    });
+    Object.values(layers).forEach(arr => arr.sort((a, b) => {
+        const ai = opOrder.findIndex(op => a.includes(op));
+        const bi = opOrder.findIndex(op => b.includes(op));
+        return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+    }));
+
+    if (embed.length > 0) {
+        const h = document.createElement('h3');
+        h.textContent = 'Embed';
+        list.appendChild(h);
+        embed.forEach(k => list.appendChild(makeTensorItem(k)));
+    }
+
+    Object.keys(layers).sort((a, b) => parseInt(a) - parseInt(b)).forEach(l => {
+        const h = document.createElement('h3');
+        h.textContent = `Layer ${l}`;
+        list.appendChild(h);
+        layers[l].forEach(k => list.appendChild(makeTensorItem(k)));
+    });
+
+    if (tail.length > 0) {
+        const h = document.createElement('h3');
+        h.textContent = 'Output';
+        list.appendChild(h);
+        tail.forEach(k => list.appendChild(makeTensorItem(k)));
+    }
+}
+
+function makeTensorItem(key) {
+    const div = document.createElement('div');
+    div.className = 'tensor-item' + (selectedTensors.has(key) ? ' selected' : '');
+    const tensor = tensors[key];
+    div.textContent = `${key} [${tensor.header.rows}x${tensor.header.cols}]`;
+    div.onclick = () => {
+        if (selectedTensors.has(key)) {
+            selectedTensors.delete(key);
+        } else {
+            selectedTensors.add(key);
+        }
+        updateSidebar();
+        updateViewport();
+    };
+    return div;
+}
+
+function getOpOrder(keys) {
+    const embed = keys.filter(k => !k.startsWith('L') && k.toLowerCase().includes('embed'));
+    const tail = keys.filter(k => !k.startsWith('L') && !k.toLowerCase().includes('embed'));
+    const opOrd = ['input_layernorm', 'q_proj', 'k_proj', 'v_proj', 'o_proj',
+                   'post_attention_layernorm', 'gate_proj', 'up_proj', 'down_proj'];
+    const layered = keys.filter(k => k.startsWith('L')).sort((a, b) => {
+        const la = parseInt(a.match(/^L(\d+)/)?.[1] || '0');
+        const lb = parseInt(b.match(/^L(\d+)/)?.[1] || '0');
+        if (la !== lb) return la - lb;
+        const ai = opOrd.findIndex(op => a.includes(op));
+        const bi = opOrd.findIndex(op => b.includes(op));
+        return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+    });
+    return [...embed, ...layered, ...tail];
+}
+
+function updateViewport() {
+    const viewport = document.getElementById('viewport');
+    viewport.innerHTML = '';
+
+    const toShow = selectedTensors.size > 0
+        ? [...selectedTensors].filter(k => tensors[k])
+        : getOpOrder(Object.keys(tensors));
+
+    if (compareMode && snapshots.length > 1) {
+        // Get the viewport wrap width so each block matches normal layout
+        const wrapWidth = document.querySelector('.viewport-wrap').offsetWidth - 40; // minus padding
+        viewport.style.flexWrap = 'nowrap';
+        viewport.style.gap = '80px';
+        viewport.style.width = 'max-content';
+        snapshots.forEach(snap => {
+            const block = document.createElement('div');
+            block.style.cssText = `width: ${wrapWidth}px; flex-shrink: 0; display: flex; flex-wrap: wrap; gap: 20px; align-items: start; align-content: start;`;
+            const label = document.createElement('div');
+            label.style.cssText = 'font-size: 11px; color: #8888ff; margin-bottom: 8px; font-weight: bold; width: 100%;';
+            label.textContent = snap.name.replace('.safetensors', '');
+            block.appendChild(label);
+            toShow.forEach(key => {
+                if (snap.tensors[key]) {
+                    block.appendChild(createTensorCard(snap.tensors[key]));
+                }
+            });
+            viewport.appendChild(block);
+        });
+    } else {
+        viewport.style.flexWrap = 'wrap';
+        viewport.style.gap = '20px';
+        viewport.style.width = '';
+        toShow.forEach(key => {
+            viewport.appendChild(createTensorCard(tensors[key]));
+        });
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONTROLS
+// ═══════════════════════════════════════════════════════════════════════════
+
+document.getElementById('btn-load').onclick = () => {
+    // Create hidden file input for local files
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.accept = '.bin,.json,.safetensors';
+    input.onchange = () => handleFiles(input.files);
+    input.click();
+};
+
+document.getElementById('colormap').onchange = updateViewport;
+document.getElementById('scale-mode').onchange = updateViewport;
+document.getElementById('max-cells').onchange = updateViewport;
+
+let wasPlaying = false;
+document.getElementById('btn-compare').onclick = function() {
+    compareMode = !compareMode;
+    this.classList.toggle('active', compareMode);
+    this.textContent = compareMode ? 'Compare (on)' : 'Compare';
+    document.getElementById('btn-clear-compare').style.display = compareMode ? '' : 'none';
+    if (compareMode && playing) {
+        wasPlaying = true;
+        document.getElementById('btn-play').click(); // pause
+    } else if (!compareMode && wasPlaying) {
+        wasPlaying = false;
+        document.getElementById('btn-play').click(); // resume
+    }
+    updateViewport();
+};
+
+document.getElementById('btn-clear-compare').onclick = () => {
+    snapshots = [];
+    tensors = {};
+    compareMode = false;
+    document.getElementById('btn-compare').classList.remove('active');
+    document.getElementById('btn-compare').textContent = 'Compare';
+    document.getElementById('btn-clear-compare').style.display = 'none';
+    document.getElementById('snapshot-count').textContent = '';
+    document.getElementById('status').textContent = 'Load a .safetensors file';
+    updateSidebar();
+    updateViewport();
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PLAYBACK — load checkpoint dir, scrub/play through steps
+// ═══════════════════════════════════════════════════════════════════════════
+
+let playTimer = null;
+let playing = false;
+
+document.getElementById('btn-load-dir').onclick = () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.webkitdirectory = true;
+    input.onchange = () => {
+        // Filter to just .safetensors checkpoint files
+        const files = [...input.files]
+            .filter(f => f.name.endsWith('.safetensors'))
+            .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+        if (files.length === 0) return;
+
+        snapshots = [];
+        document.getElementById('status').textContent = `Loading ${files.length} checkpoints...`;
+
+        const promises = files.map(f =>
+            f.arrayBuffer().then(buf => {
+                snapshots.push({ name: f.name, tensors: parseSafetensors(buf) });
+            })
+        );
+
+        Promise.all(promises).then(() => {
+            snapshots.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+            // Set slider range
+            const slider = document.getElementById('step-slider');
+            slider.min = 0;
+            slider.max = snapshots.length - 1;
+            slider.value = 0;
+            // Show first snapshot
+            tensors = snapshots[0].tensors;
+            updateStepLabel(0);
+            document.getElementById('status').textContent = `${snapshots.length} checkpoints loaded`;
+            updateSidebar();
+            updateViewport();
+        });
+    };
+    input.click();
+};
+
+function updateStepLabel(idx) {
+    const name = snapshots[idx]?.name.replace('.safetensors', '') || '—';
+    document.getElementById('step-label').textContent = `${idx + 1}/${snapshots.length}: ${name}`;
+}
+
+document.getElementById('step-slider').oninput = function() {
+    const idx = parseInt(this.value);
+    if (snapshots[idx]) {
+        tensors = snapshots[idx].tensors;
+        updateStepLabel(idx);
+        updateViewport();
+    }
+};
+
+document.getElementById('btn-play').onclick = function() {
+    if (playing) {
+        clearInterval(playTimer);
+        playing = false;
+        this.textContent = '▶';
+        return;
+    }
+    if (snapshots.length < 2) return;
+    playing = true;
+    this.textContent = '⏸';
+    const slider = document.getElementById('step-slider');
+    playTimer = setInterval(() => {
+        let idx = parseInt(slider.value) + 1;
+        if (idx >= snapshots.length) idx = 0;
+        slider.value = idx;
+        tensors = snapshots[idx].tensors;
+        updateStepLabel(idx);
+        updateViewport();
+    }, 1000);
+};
+
+document.addEventListener('keydown', (e) => {
+    if (snapshots.length < 2) return;
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    const slider = document.getElementById('step-slider');
+    let idx = parseInt(slider.value) + (e.key === 'ArrowRight' ? 1 : -1);
+    if (idx < 0) idx = 0;
+    if (idx >= snapshots.length) idx = snapshots.length - 1;
+    slider.value = idx;
+    tensors = snapshots[idx].tensors;
+    updateStepLabel(idx);
+    updateViewport();
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ZOOM + PAN
+// ═══════════════════════════════════════════════════════════════════════════
+
+let zoomLevel = 1, panX = 0, panY = 0, isPanning = false, panStartX = 0, panStartY = 0;
+const $vp = document.getElementById('viewport');
+
+function applyTransform() {
+    $vp.style.transformOrigin = '0 0';
+    $vp.style.transform = `translate(${panX}px, ${panY}px) scale(${zoomLevel})`;
+}
+
+$vp.parentElement.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const delta = e.deltaY > 0 ? 0.9 : 1.1;
+    const newZoom = Math.max(0.1, Math.min(10, zoomLevel * delta));
+
+    // Zoom toward cursor
+    const rect = $vp.parentElement.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    panX = mx - (mx - panX) * (newZoom / zoomLevel);
+    panY = my - (my - panY) * (newZoom / zoomLevel);
+    zoomLevel = newZoom;
+    applyTransform();
+}, { passive: false });
+
+$vp.parentElement.addEventListener('mousedown', (e) => {
+    if (e.button === 1 || (e.button === 0 && !e.shiftKey)) {
+        isPanning = true;
+        panStartX = e.clientX - panX;
+        panStartY = e.clientY - panY;
+        $vp.parentElement.style.cursor = 'grabbing';
+        e.preventDefault();
+    }
+});
+
+window.addEventListener('mousemove', (e) => {
+    if (!isPanning) return;
+    panX = e.clientX - panStartX;
+    panY = e.clientY - panStartY;
+    applyTransform();
+});
+
+window.addEventListener('mouseup', () => {
+    if (isPanning) {
+        isPanning = false;
+        $vp.parentElement.style.cursor = '';
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WALLPAPER
+// ═══════════════════════════════════════════════════════════════════════════
+
+const $vpWrap = $vp.parentElement;
+
+document.getElementById('btn-wallpaper').addEventListener('click', () => {
+    document.getElementById('wallpaper-file').click();
+});
+
+document.getElementById('wallpaper-file').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+        setWallpaper(reader.result);
+        localStorage.setItem('tensor-viewer-wallpaper', reader.result);
+    };
+    reader.readAsDataURL(file);
+});
+
+document.getElementById('btn-wallpaper-clear').addEventListener('click', () => {
+    $vpWrap.style.backgroundImage = '';
+    localStorage.removeItem('tensor-viewer-wallpaper');
+});
+
+function setWallpaper(dataUrl) {
+    $vpWrap.style.backgroundImage = `url(${dataUrl})`;
+}
+
+const savedWP = localStorage.getItem('tensor-viewer-wallpaper');
+if (savedWP) setWallpaper(savedWP);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INIT MESSAGE
+// ═══════════════════════════════════════════════════════════════════════════
+
+document.getElementById('status').textContent = 'Load a .safetensors file or drag & drop .bin snapshots';
+document.getElementById('viewport').innerHTML = `
+<div style="padding: 40px; color: #555; text-align: center; width: 100%;">
+    <h2 style="color: #666; margin-bottom: 20px;">SERAPH TENSOR VIEWER</h2>
+    <p style="margin-bottom: 10px;">Click <strong>Load Files</strong> and select a <code>.safetensors</code> checkpoint</p>
+    <p style="margin-bottom: 10px;">Or drag &amp; drop <code>.safetensors</code> / <code> lora .bin</code> files here</p>
+    <p style="margin-top: 30px; color: #444;">
+        Supports safetensors (BF16/F16/F32) and SRPH binary snapshots
+    </p>
+</div>`;
+
+</script>
+</body>
+</html>

@@ -1,0 +1,50 @@
+#version 450
+
+// Reduce max absolute value over a flat float buffer.
+// Input: binding 0 (read-only), Output: binding 1 single float (maxabs)
+// Launch: workgroups = ceil(n / (local_size_x * 2)), local_size_x=256
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer InBuf { float data[]; };
+layout(binding = 1) buffer OutBuf { uint out_bits; };
+
+layout(push_constant) uniform PushConstants {
+    uint count;
+} params;
+
+shared float sdata[LOCAL_SIZE_X];
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint idx = gid * 2;  // process two elements per thread
+
+    float v0 = 0.0;
+    float v1 = 0.0;
+    if (idx < params.count) {
+        v0 = abs(data[idx]);
+        if (idx + 1 < params.count) v1 = abs(data[idx + 1]);
+    }
+    // Treat NaN as +INF so overflow detection triggers.
+    if (isnan(v0)) v0 = uintBitsToFloat(0x7f800000);
+    if (isnan(v1)) v1 = uintBitsToFloat(0x7f800000);
+    float local_max = max(v0, v1);
+    sdata[tid] = local_max;
+    barrier();
+
+    // reduction
+    for (uint stride = gl_WorkGroupSize.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] = max(sdata[tid], sdata[tid + stride]);
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        // out_bits stores float bits; monotonic for non-negative values.
+        uint local_bits = floatBitsToUint(sdata[0]);
+        atomicMax(out_bits, local_bits);
+    }
+}

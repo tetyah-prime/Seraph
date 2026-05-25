@@ -1,0 +1,41 @@
+#version 450
+
+// SiLU backward pass (proper derivative)
+//
+// Forward:  y = silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+// Backward: dy/dx = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
+//                 = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+//
+// Given:
+//   - input: original input x to silu
+//   - grad_output: gradient flowing back from next layer
+// Compute:
+//   - grad_input: gradient w.r.t. input x
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer BufferInput { float input_data[]; };
+layout(binding = 1) readonly buffer BufferGradOutput { float grad_output[]; };
+layout(binding = 2) buffer BufferGradInput { float grad_input[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint size;
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.size) return;
+
+    float x = input_data[idx];
+    float grad_out = grad_output[idx];
+
+    // Compute sigmoid(x) = 1 / (1 + exp(-x))
+    float sigmoid_x = 1.0 / (1.0 + exp(-x));
+
+    // SiLU derivative: sigmoid(x) * (1 + x * (1 - sigmoid(x))) factored form
+    float silu_derivative = sigmoid_x * (1.0 + x * (1.0 - sigmoid_x));
+
+    // Chain rule: grad_input = grad_output * dy/dx
+    grad_input[idx] = grad_out * silu_derivative;
+}

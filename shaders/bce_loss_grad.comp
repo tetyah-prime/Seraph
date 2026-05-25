@@ -1,0 +1,44 @@
+#version 450
+
+// Binary Cross-Entropy loss + gradient for mask segmentation
+// loss = max(logits, 0) - logits * target + log(1 + exp(-|logits|))
+// grad = sigmoid(logits) - target
+//
+// IGNORE: If target < 0, this element is ignored (loss=0, grad=0)
+// Use target=-1 for background/invalid queries that shouldn't contribute to training
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer Logits { float logits[]; };
+layout(binding = 1) readonly buffer Targets { float targets[]; };  // 0, 1, or <0 for ignore
+layout(binding = 2) writeonly buffer GradLogits { float grad_logits[]; };
+layout(binding = 3) buffer LossOut { float loss_out[]; };  // per-element loss
+
+layout(push_constant) uniform PushConstants {
+    uint count;
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.count) return;
+
+    float x = logits[idx];
+    float t = targets[idx];
+
+    // Ignore elements with negative target (background queries)
+    if (t < 0.0) {
+        loss_out[idx] = 0.0;
+        grad_logits[idx] = 0.0;
+        return;
+    }
+
+    // Numerically stable BCE
+    float max_val = max(x, 0.0);
+    float loss = max_val - x * t + log(1.0 + exp(-abs(x)));
+    loss_out[idx] = loss;
+
+    // Gradient: sigmoid(x) - t
+    float sig = 1.0 / (1.0 + exp(-x));
+    grad_logits[idx] = sig - t;
+}

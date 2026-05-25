@@ -1,0 +1,108 @@
+#version 450
+
+// RMSNorm backward pass
+// CAS-based float atomic add (no GL_EXT_shader_atomic_float needed)
+//
+// Forward: 
+//   y[i] = (x[i] / rms) * scale[i]
+//   rms = sqrt(sum(x[j]^2) / N + eps)
+//
+// Backward:
+//   grad_scale[i] = grad_out[i] * (x[i] / rms)
+//   grad_input[i] = (grad_out[i] * scale[i] / rms)  -  (x[i] / (N * rms^3)) * sum(grad_out[j] * scale[j] * x[j])
+//                   \__________________________/       \_____________________________________________________/
+//                         grad_direct                                    grad_coupled
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer BufferInput { float input_data[]; };      // Original input x
+layout(binding = 1) readonly buffer BufferScale { float scale[]; };           // Scale weights
+layout(binding = 2) readonly buffer BufferGradOutput { float grad_output[]; };// Gradient from next layer
+layout(binding = 3) buffer BufferGradInput { float grad_input[]; };           // Gradient w.r.t. input
+layout(binding = 4) coherent buffer BufferGradScale { uint grad_scale[]; };   // Gradient w.r.t. scale (accumulated via CAS)
+
+layout(push_constant) uniform PushConstants {
+    uint size;      // Hidden dimension
+    float eps;      // Epsilon for numerical stability
+} params;
+
+// Use shared memory for reduction
+shared float shared_data[LOCAL_SIZE_X];
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    float x = 0.0;
+    float grad_out = 0.0;
+    float s = 1.0;
+
+    if (idx < params.size) {
+        x = input_data[idx];
+        grad_out = grad_output[idx];
+        s = scale[idx];
+    }
+
+    // Step 1: Compute RMS (same as forward pass)
+    float x_sq = x * x;
+
+    // Parallel reduction to compute sum(x^2)
+    shared_data[tid] = x_sq;
+    barrier();
+
+    // Reduction in shared memory
+    for (uint offset = gl_WorkGroupSize.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset && (tid + offset) < params.size) {
+            shared_data[tid] += shared_data[tid + offset];
+        }
+        barrier();
+    }
+
+    float sum_sq = shared_data[0];
+    float mean_sq = sum_sq / float(params.size);
+    float rms = sqrt(mean_sq + params.eps);
+    float inv_rms = 1.0 / rms;
+
+    // Step 2: Gradient for scale parameter (simple)
+    // grad_scale[i] = grad_output[i] * (x[i] / rms)
+    if (idx < params.size) {
+        // CAS loop: float atomic add
+        float val = grad_out * x * inv_rms;
+        uint expected = grad_scale[idx];
+        while (true) {
+            uint desired = floatBitsToUint(uintBitsToFloat(expected) + val);
+            uint old = atomicCompSwap(grad_scale[idx], expected, desired);
+            if (old == expected) break;
+            expected = old;
+        }
+    }
+
+    // Step 3: Gradient for input (complex - all elements are coupled through RMS)
+    // grad_input[i] = (grad_output[i] * scale[i] / rms) -
+    //                 (x[i] / (rms^3 * N)) * sum_j(grad_output[j] * scale[j] * x[j])
+
+    // First term: direct gradient
+    float grad_direct = grad_out * s * inv_rms;
+
+    // Second term: coupled through RMS normalization
+    // Compute sum_j(grad_output[j] * scale[j] * x[j])
+    float coupled_term = grad_out * s * x;
+    shared_data[tid] = coupled_term;
+    barrier();
+
+    // Reduction for coupled term
+    for (uint offset = gl_WorkGroupSize.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset && (tid + offset) < params.size) {
+            shared_data[tid] += shared_data[tid + offset];
+        }
+        barrier();
+    }
+
+    float sum_coupled = shared_data[0];
+    float grad_coupled = (x / (rms * rms * rms * float(params.size))) * sum_coupled;
+
+    if (idx < params.size) {
+        grad_input[idx] = grad_direct - grad_coupled;
+    }
+}

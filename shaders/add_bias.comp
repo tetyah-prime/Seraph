@@ -1,0 +1,21 @@
+#version 450
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) buffer InOut { float data[]; };
+layout(binding = 1) readonly buffer Bias { float bias[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint cols;
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = params.rows * params.cols;
+    if (idx >= total) return;
+
+    uint col = idx % params.cols;
+    data[idx] += bias[col];
+}

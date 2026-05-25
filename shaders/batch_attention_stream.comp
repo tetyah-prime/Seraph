@@ -1,0 +1,168 @@
+#version 450
+
+// Streaming causal multi-head attention (no fixed max seq_len).
+//
+// Computes: out = softmax(Q @ K^T * scale) @ V with causal mask.
+// Uses numerically-stable online softmax to avoid storing scores.
+//
+// Dispatch: (num_heads, seq_len, 1) workgroups
+//
+// Workgroup layout:
+// - local_size_x=64 threads for reductions over keys (matches AMD wavefront)
+// - local_size_y=8 lanes for output dimensions (covers up to 256 dims per workgroup,
+//   and also supports larger head_dim via striding).
+//
+// Important: the previous version only computed the first 32 output dims when head_dim > 32.
+// This version computes all dims (no unwritten garbage).
+
+// local_size_x (id=0) and local_size_y (id=1) set via specialization constants (tuned per GPU).
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+layout(constant_id = 1) const uint LOCAL_SIZE_Y = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer BufferQ { float Q[]; };
+layout(binding = 1) readonly buffer BufferK { float K[]; };
+layout(binding = 2) readonly buffer BufferV { float V[]; };
+layout(binding = 3) writeonly buffer BufferOut { float attn_out[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint num_heads;
+    uint kv_heads;
+    uint head_dim;
+    float scale;
+} params;
+
+shared float s_red[LOCAL_SIZE_X];
+shared float s_max;
+shared float s_sum;
+shared float s_m_final;
+shared float s_l_final;
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint query_pos = gl_WorkGroupID.y;
+    uint tid_x = gl_LocalInvocationID.x;
+    uint tid_y = gl_LocalInvocationID.y;
+    uint num_threads = gl_WorkGroupSize.x;
+
+    if (head >= params.num_heads || query_pos >= params.seq_len) return;
+
+    uint kv_head = head * params.kv_heads / params.num_heads;
+    uint attend_len = query_pos + 1;
+
+    uint q_offset = query_pos * params.num_heads * params.head_dim + head * params.head_dim;
+    uint out_offset = q_offset;
+
+    // Pass 1: compute (m,l) for this (head, query_pos).
+    // IMPORTANT: all invocations must participate in the same barrier() sequence.
+    float m = -1e30;
+    float l = 0.0;
+
+    const uint BLOCK = gl_WorkGroupSize.x;
+    for (uint base = 0; base < attend_len; base += BLOCK) {
+        uint end = min(attend_len, base + BLOCK);
+
+        // Max over the block (only y==0 lanes contribute; others write neutral values).
+        float local_max = -1e30;
+        if (tid_y == 0) {
+            for (uint j = base + tid_x; j < end; j += num_threads) {
+                uint k_offset = j * params.kv_heads * params.head_dim + kv_head * params.head_dim;
+                float score = 0.0;
+                for (uint kk = 0; kk < params.head_dim; kk++) {
+                    score += Q[q_offset + kk] * K[k_offset + kk];
+                }
+                score *= params.scale;
+                local_max = max(local_max, score);
+            }
+        }
+
+        // IMPORTANT: avoid shared-memory races: only one y-lane writes s_red[tid_x].
+        if (tid_y == 0) {
+            s_red[tid_x] = local_max;
+        }
+        barrier();
+        // Tree reduction for max
+        if (tid_y == 0) {
+            for (uint stride = num_threads / 2; stride > 0; stride >>= 1) {
+                if (tid_x < stride) {
+                    s_red[tid_x] = max(s_red[tid_x], s_red[tid_x + stride]);
+                }
+                barrier();
+            }
+        } else { barrier(); }
+        if (tid_x == 0 && tid_y == 0) s_max = s_red[0];
+        barrier();
+        float block_max = s_max;
+
+        // Sumexp over the block (only y==0 lanes contribute; others write 0).
+        float local_sum = 0.0;
+        if (tid_y == 0) {
+            for (uint j = base + tid_x; j < end; j += num_threads) {
+                uint k_offset = j * params.kv_heads * params.head_dim + kv_head * params.head_dim;
+                float score = 0.0;
+                for (uint kk = 0; kk < params.head_dim; kk++) {
+                    score += Q[q_offset + kk] * K[k_offset + kk];
+                }
+                score *= params.scale;
+                local_sum += exp(score - block_max);
+            }
+        }
+
+        if (tid_y == 0) {
+            s_red[tid_x] = local_sum;
+        }
+        barrier();
+        // Tree reduction for sum
+        if (tid_y == 0) {
+            for (uint stride = num_threads / 2; stride > 0; stride >>= 1) {
+                if (tid_x < stride) {
+                    s_red[tid_x] += s_red[tid_x + stride];
+                }
+                barrier();
+            }
+        } else { barrier(); }
+        if (tid_x == 0 && tid_y == 0) s_sum = s_red[0];
+        barrier();
+        float block_sum = s_sum;
+
+        if (tid_y == 0) {
+            float m_new = max(m, block_max);
+            float alpha = exp(m - m_new);
+            float beta = exp(block_max - m_new);
+            float l_new = alpha * l + beta * block_sum;
+            m = m_new;
+            l = l_new;
+        }
+        barrier();
+    }
+
+    if (tid_x == 0 && tid_y == 0) {
+        s_m_final = m;
+        s_l_final = l;
+    }
+    barrier();
+
+    float m_final = s_m_final;
+    float l_final = max(1e-20, s_l_final);
+
+    // Pass 2: compute numerator for each output dim.
+    // Each invocation handles d = tid_x + tid_y*local_size_x, striding by total lanes.
+    uint lanes = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
+    uint d0 = tid_x + tid_y * gl_WorkGroupSize.x;
+    for (uint d = d0; d < params.head_dim; d += lanes) {
+        float acc = 0.0;
+        for (uint j = 0; j < attend_len; j++) {
+            uint k_offset = j * params.kv_heads * params.head_dim + kv_head * params.head_dim;
+            uint v_offset = k_offset;
+            float score = 0.0;
+            for (uint kk = 0; kk < params.head_dim; kk++) {
+                score += Q[q_offset + kk] * K[k_offset + kk];
+            }
+            score *= params.scale;
+            float p = exp(score - m_final) / l_final;
+            acc += p * V[v_offset + d];
+        }
+        attn_out[out_offset + d] = acc;
+    }
+}

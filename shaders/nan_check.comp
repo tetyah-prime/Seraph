@@ -1,0 +1,26 @@
+#version 450
+
+// NaN/Inf checker for float buffers.
+// Sets flags[flag_index] |= 1 if any element is NaN or Inf.
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer BufferIn { float data[]; };
+layout(binding = 1) buffer BufferFlags { uint flags[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint count;
+    uint flag_index;
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.count) return;
+
+    float x = data[idx];
+    if (isnan(x) || isinf(x)) {
+        atomicOr(flags[params.flag_index], 1u);
+    }
+}
+

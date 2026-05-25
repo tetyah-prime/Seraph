@@ -1,0 +1,35 @@
+#version 450
+
+// Backward pass for element-wise multiplication: C = A ⊙ B
+//
+// Forward:  c = a * b
+// Backward: grad_a = grad_c * b
+//           grad_b = grad_c * a
+//
+// This handles the Hadamard product backprop for FFN: ffn_hidden = silu(gate) ⊙ up
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer BufferA { float A[]; };          // First input
+layout(binding = 1) readonly buffer BufferB { float B[]; };          // Second input
+layout(binding = 2) readonly buffer BufferGradC { float grad_C[]; }; // Gradient from output
+layout(binding = 3) buffer BufferGradA { float grad_A[]; };          // Gradient w.r.t. A (accumulated)
+layout(binding = 4) buffer BufferGradB { float grad_B[]; };          // Gradient w.r.t. B (accumulated)
+
+layout(push_constant) uniform PushConstants {
+    uint size;
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.size) return;
+
+    float a = A[idx];
+    float b = B[idx];
+    float grad_c = grad_C[idx];
+
+    // Accumulate gradients (use += for gradient accumulation)
+    grad_A[idx] = grad_c * b;
+    grad_B[idx] = grad_c * a;
+}

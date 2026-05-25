@@ -1,0 +1,51 @@
+#version 450
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer FrameIn { float frame[]; };
+layout(binding = 1) writeonly buffer PatchesOut { float patches[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint frame_h;
+    uint frame_w;
+    uint channels;
+    uint patch_t;
+    uint patch_h;
+    uint patch_w;
+    uint num_patches_h;
+    uint num_patches_w;
+} params;
+
+void main() {
+    uint patch_idx = gl_GlobalInvocationID.x;
+
+    uint total_patches = params.num_patches_h * params.num_patches_w;
+    if (patch_idx >= total_patches) return;
+
+    uint patch_y = patch_idx / params.num_patches_w;
+    uint patch_x = patch_idx % params.num_patches_w;
+
+    uint frame_y = patch_y * params.patch_h;
+    uint frame_x = patch_x * params.patch_w;
+
+    uint patch_size = params.channels * params.patch_t * params.patch_h * params.patch_w;
+    uint out_base = patch_idx * patch_size;
+
+    uint out_idx = 0;
+    for (uint t = 0; t < params.patch_t; t++) {
+        for (uint c = 0; c < params.channels; c++) {
+            for (uint py = 0; py < params.patch_h; py++) {
+                for (uint px = 0; px < params.patch_w; px++) {
+                    uint fy = frame_y + py;
+                    uint fx = frame_x + px;
+                    uint frame_idx = (t * params.channels * params.frame_h * params.frame_w) +
+                                     (c * params.frame_h * params.frame_w) +
+                                     (fy * params.frame_w) + fx;
+                    patches[out_base + out_idx] = frame[frame_idx];
+                    out_idx++;
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,81 @@
+#version 450
+
+// Stable Softmax: output = exp(input - max) / sum(exp(input - max))
+// Each workgroup processes one row
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer BufferInput {
+    float data_in[];
+};
+
+layout(binding = 1) writeonly buffer BufferOutput {
+    float data_out[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint cols;
+} params;
+
+// Shared memory for reduction
+shared float shared_max[LOCAL_SIZE_X];
+shared float shared_sum[LOCAL_SIZE_X];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint local_size = gl_WorkGroupSize.x;
+
+    if (row >= params.rows) return;
+
+    uint row_offset = row * params.cols;
+
+    // Phase 1: Find max value in row (for numerical stability)
+    float local_max = -1e38;  // Very negative number
+    for (uint i = tid; i < params.cols; i += local_size) {
+        float val = data_in[row_offset + i];
+        local_max = max(local_max, val);
+    }
+
+    shared_max[tid] = local_max;
+    barrier();
+
+    // Reduction to find global max
+    for (uint stride = local_size / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
+        }
+        barrier();
+    }
+
+    float row_max = shared_max[0];
+    barrier();
+
+    // Phase 2: Compute sum of exp(x - max)
+    float local_sum = 0.0;
+    for (uint i = tid; i < params.cols; i += local_size) {
+        local_sum += exp(data_in[row_offset + i] - row_max);
+    }
+
+    shared_sum[tid] = local_sum;
+    barrier();
+
+    // Reduction to find total sum
+    for (uint stride = local_size / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        barrier();
+    }
+
+    float row_sum = shared_sum[0];
+    barrier();
+
+    // Phase 3: Compute normalized output
+    for (uint i = tid; i < params.cols; i += local_size) {
+        float val = exp(data_in[row_offset + i] - row_max) / row_sum;
+        data_out[row_offset + i] = val;
+    }
+}

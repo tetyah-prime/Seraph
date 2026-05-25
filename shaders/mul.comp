@@ -1,0 +1,22 @@
+#version 450
+
+// Element-wise multiplication: C = A * B
+// Hadamard product - one thread per element
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer BufferA { float A[]; };
+layout(binding = 1) readonly buffer BufferB { float B[]; };
+layout(binding = 2) buffer BufferC { float C[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint size;
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.size) return;
+
+    C[idx] = A[idx] * B[idx];
+}

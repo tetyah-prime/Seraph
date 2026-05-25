@@ -1,0 +1,76 @@
+#version 450
+
+// QK RMSNorm - normalize Q or K across all heads
+//
+// For video/ViT models: prevents attention collapse at scale
+// Computes RMS across entire (num_heads * head_dim) dimension per sequence position
+// Then divides by RMS
+//
+// Memory layout (row-major):
+//   QK: [seq_len, num_heads * head_dim]
+//
+// Dispatch: (seq_len, 1, 1) workgroups
+// Each workgroup normalizes one sequence position
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) buffer BufferQK { float qk[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint num_heads;
+    uint head_dim;
+    uint use_qk_norm;  // 0 = disabled, 1 = enabled (for --video flag)
+    float eps;
+} params;
+
+shared float s_partial_sum[LOCAL_SIZE_X];
+
+void main() {
+    // Early exit if qk_norm disabled (LLM mode)
+    if (params.use_qk_norm == 0) return;
+
+    uint seq_idx = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint num_threads = gl_WorkGroupSize.x;
+
+    if (seq_idx >= params.seq_len) return;
+
+    uint total_dim = params.num_heads * params.head_dim;
+    uint base = seq_idx * total_dim;
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 1: Compute sum of squares (parallel reduction)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    float local_sum_sq = 0.0;
+    for (uint i = tid; i < total_dim; i += num_threads) {
+        float v = qk[base + i];
+        local_sum_sq += v * v;
+    }
+
+    s_partial_sum[tid] = local_sum_sq;
+    barrier();
+
+    // Tree reduction for sum (log2 steps, balanced error cancellation)
+    for (uint stride = num_threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_partial_sum[tid] += s_partial_sum[tid + stride];
+        }
+        barrier();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 2: Compute RMS and normalize
+    // ═══════════════════════════════════════════════════════════════════════
+
+    float rms = sqrt(s_partial_sum[0] / float(total_dim));
+    rms = max(rms, params.eps);  // Prevent division by zero
+    float inv_rms = 1.0 / rms;
+
+    // Normalize all values
+    for (uint i = tid; i < total_dim; i += num_threads) {
+        qk[base + i] *= inv_rms;
+    }
+}

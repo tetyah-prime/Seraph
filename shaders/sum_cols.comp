@@ -1,0 +1,27 @@
+#version 450
+// Sum columns: for each column, sum all rows
+// Input:  data[rows, cols]
+// Output: out[cols]
+// out[col] = sum_{row=0}^{rows-1} data[row * cols + col]
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer Data { float data[]; };
+layout(binding = 1) writeonly buffer Out { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint cols;
+} params;
+
+void main() {
+    uint col = gl_GlobalInvocationID.x;
+    if (col >= params.cols) return;
+
+    float sum = 0.0;
+    for (uint row = 0; row < params.rows; row++) {
+        sum += data[row * params.cols + col];
+    }
+    out_data[col] = sum;
+}

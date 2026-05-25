@@ -1,0 +1,941 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TETYAH Band Monitor Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #0a0a0a;
+            color: #00ff00;
+            font-family: 'Courier New', monospace;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* Matrix rain background */
+        .matrix-bg {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            opacity: 0.03;
+            z-index: -1;
+            background: repeating-linear-gradient(
+                0deg,
+                transparent,
+                transparent 2px,
+                #00ff00 2px,
+                #00ff00 4px
+            );
+            animation: scanline 8s linear infinite;
+        }
+
+        @keyframes scanline {
+            0% { background-position: 0 0; }
+            100% { background-position: 0 100vh; }
+        }
+
+        /* Header */
+        .header {
+            background: linear-gradient(180deg, #001a00 0%, #000a00 100%);
+            border-bottom: 2px solid #00ff00;
+            padding: 15px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 0 20px rgba(0, 255, 0, 0.3);
+        }
+
+        .header h1 {
+            font-size: 24px;
+            text-shadow: 0 0 10px #00ff00;
+            letter-spacing: 2px;
+        }
+
+        .header-controls {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+
+        .btn {
+            background: #001a00;
+            border: 1px solid #00ff00;
+            color: #00ff00;
+            padding: 8px 16px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
+
+        .btn:hover {
+            background: #00ff00;
+            color: #000;
+            box-shadow: 0 0 15px #00ff00;
+        }
+
+        /* Main container */
+        .container {
+            display: flex;
+            height: calc(100vh - 70px);
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 280px;
+            background: #0d0d0d;
+            border-right: 1px solid #003300;
+            padding: 15px;
+            overflow-y: auto;
+        }
+
+        .sidebar h3 {
+            color: #00cc00;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #003300;
+        }
+
+        .file-list {
+            list-style: none;
+        }
+
+        .file-item {
+            padding: 10px;
+            margin: 5px 0;
+            background: #0a0a0a;
+            border: 1px solid #002200;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 12px;
+        }
+
+        .file-item:hover {
+            border-color: #00ff00;
+            background: #001500;
+        }
+
+        .file-item.selected {
+            border-color: #00ff00;
+            background: #002200;
+            box-shadow: 0 0 10px rgba(0, 255, 0, 0.2);
+        }
+
+        .file-item .name {
+            font-weight: bold;
+            color: #00ff00;
+        }
+
+        .file-item .stats {
+            color: #008800;
+            font-size: 11px;
+            margin-top: 5px;
+        }
+
+        .file-item .file-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .file-item .remove-btn {
+            background: none;
+            border: none;
+            color: #660000;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 0 4px;
+            transition: color 0.2s;
+        }
+
+        .file-item .remove-btn:hover {
+            color: #ff3333;
+        }
+
+        .file-item .name {
+            cursor: pointer;
+            flex: 1;
+        }
+
+        .file-item .name-input {
+            background: #001500;
+            border: 1px solid #00ff00;
+            color: #00ff00;
+            font-family: inherit;
+            font-size: 12px;
+            padding: 2px 5px;
+            width: 100%;
+        }
+
+        .file-item .edit-btn {
+            background: none;
+            border: none;
+            color: #004400;
+            cursor: pointer;
+            font-size: 11px;
+            padding: 0 4px;
+            margin-right: 5px;
+        }
+
+        .file-item .edit-btn:hover {
+            color: #00ff00;
+        }
+
+        /* Main panel area */
+        .main-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* Panel controls */
+        .panel-controls {
+            background: #0d0d0d;
+            padding: 10px 15px;
+            border-bottom: 1px solid #003300;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .layout-btn {
+            background: #001500;
+            border: 1px solid #004400;
+            color: #00aa00;
+            padding: 5px 12px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 12px;
+        }
+
+        .layout-btn.active, .layout-btn:hover {
+            background: #002200;
+            border-color: #00ff00;
+            color: #00ff00;
+        }
+
+        /* Panels grid */
+        .panels-grid {
+            flex: 1;
+            display: grid;
+            gap: 2px;
+            background: #003300;
+            padding: 2px;
+            overflow: hidden;
+        }
+
+        .panels-grid.layout-1 { grid-template-columns: 1fr; }
+        .panels-grid.layout-2 { grid-template-columns: 1fr 1fr; }
+        .panels-grid.layout-3 { grid-template-columns: 1fr 1fr 1fr; }
+        .panels-grid.layout-4 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
+
+        /* Individual panel */
+        .panel {
+            background: #0a0a0a;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            min-height: 200px;
+        }
+
+        .panel-header {
+            background: #001500;
+            padding: 8px 12px;
+            border-bottom: 1px solid #003300;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .panel-title {
+            font-size: 14px;
+            color: #00cc00;
+        }
+
+        .panel-close {
+            background: none;
+            border: none;
+            color: #ff3333;
+            cursor: pointer;
+            font-size: 16px;
+        }
+
+        .panel-content {
+            flex: 1;
+            overflow: auto;
+            padding: 10px;
+        }
+
+        /* Band table */
+        .band-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+
+        .band-table th, .band-table td {
+            padding: 6px 8px;
+            text-align: right;
+            border: 1px solid #002200;
+        }
+
+        .band-table th {
+            background: #001500;
+            color: #00cc00;
+        }
+
+        .band-table td {
+            color: #00aa00;
+        }
+
+        .band-table tr:hover td {
+            background: #001500;
+        }
+
+        .band-table .positive { color: #00ff00; }
+        .band-table .negative { color: #ff6666; }
+        .band-table .wall { color: #ffff00; background: #1a1a00; }
+
+        /* Graph container */
+        .graph-container {
+            text-align: center;
+        }
+
+        .graph-container img {
+            max-width: 100%;
+            max-height: 100%;
+            border: 1px solid #003300;
+        }
+
+        /* Summary stats */
+        .summary-stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .stat-box {
+            background: #001500;
+            border: 1px solid #003300;
+            padding: 10px;
+            text-align: center;
+        }
+
+        .stat-box .label {
+            font-size: 10px;
+            color: #008800;
+            margin-bottom: 5px;
+        }
+
+        .stat-box .value {
+            font-size: 18px;
+            color: #00ff00;
+            text-shadow: 0 0 5px #00ff00;
+        }
+
+        /* Empty panel placeholder */
+        .empty-panel {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: #004400;
+        }
+
+        .empty-panel .icon {
+            font-size: 48px;
+            margin-bottom: 15px;
+        }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            gap: 2px;
+            margin-bottom: 10px;
+        }
+
+        .tab {
+            padding: 6px 12px;
+            background: #001500;
+            border: 1px solid #003300;
+            color: #008800;
+            cursor: pointer;
+            font-size: 11px;
+        }
+
+        .tab.active, .tab:hover {
+            background: #002200;
+            color: #00ff00;
+            border-color: #00ff00;
+        }
+
+        /* File input styling */
+        .file-input-wrapper {
+            position: relative;
+            overflow: hidden;
+            display: inline-block;
+        }
+
+        .file-input-wrapper input[type=file] {
+            position: absolute;
+            left: 0;
+            top: 0;
+            opacity: 0;
+            cursor: pointer;
+            width: 100%;
+            height: 100%;
+        }
+
+        /* Scrollbar styling */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #0a0a0a;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #003300;
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #004400;
+        }
+
+        /* Comparison mode */
+        .comparison-badge {
+            display: inline-block;
+            padding: 2px 6px;
+            background: #002200;
+            border: 1px solid #00ff00;
+            font-size: 10px;
+            margin-left: 5px;
+        }
+
+        /* Fullscreen panel */
+        .panel.fullscreen {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: 1000;
+            border: 2px solid #00ff00;
+            box-shadow: 0 0 50px rgba(0, 255, 0, 0.5);
+        }
+
+        .panel-header .fullscreen-btn {
+            background: none;
+            border: none;
+            color: #00aa00;
+            cursor: pointer;
+            font-size: 14px;
+            margin-right: 10px;
+            transition: color 0.2s;
+        }
+
+        .panel-header .fullscreen-btn:hover {
+            color: #00ff00;
+            text-shadow: 0 0 5px #00ff00;
+        }
+
+        .panel.fullscreen .fullscreen-btn {
+            color: #ffff00;
+        }
+
+        .panel.fullscreen .panel-content {
+            height: calc(100vh - 50px);
+        }
+
+        .panel.fullscreen .graph-container {
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .panel.fullscreen .graph-container img {
+            max-height: calc(100vh - 80px);
+            object-fit: contain;
+        }
+
+        .panel.fullscreen .band-table {
+            font-size: 14px;
+        }
+
+        .panel.fullscreen .band-table th,
+        .panel.fullscreen .band-table td {
+            padding: 10px 15px;
+        }
+    </style>
+</head>
+<body>
+    <div class="matrix-bg"></div>
+
+    <div class="header">
+        <h1>🐍 TETYAH BAND MONITOR</h1>
+        <div class="header-controls">
+            <div class="file-input-wrapper">
+                <button class="btn">📁 Load Log File</button>
+                <input type="file" id="logFileInput" accept=".log,.txt" multiple>
+            </div>
+            <div class="file-input-wrapper">
+                <button class="btn">📊 Load Graph</button>
+                <input type="file" id="graphFileInput" accept="image/*" multiple>
+            </div>
+            <button class="btn" onclick="clearAll()">🗑️ Clear All</button>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="sidebar">
+            <h3>📂 Loaded Files</h3>
+            <ul class="file-list" id="fileList">
+                <li class="file-item" style="color: #004400; border-style: dashed;">
+                    No files loaded. Use buttons above to load train.log files or graphs.
+                </li>
+            </ul>
+        </div>
+
+        <div class="main-panel">
+            <div class="panel-controls">
+                <span style="color: #008800; margin-right: 10px;">Layout:</span>
+                <button class="layout-btn active" onclick="setLayout(1)">▣ 1</button>
+                <button class="layout-btn" onclick="setLayout(2)">▥ 2</button>
+                <button class="layout-btn" onclick="setLayout(3)">▦ 3</button>
+                <button class="layout-btn" onclick="setLayout(4)">▩ 4</button>
+                <span style="margin-left: auto; color: #006600; font-size: 12px;">
+                    Click files in sidebar to add to panels
+                </span>
+            </div>
+
+            <div class="panels-grid layout-1" id="panelsGrid">
+                <div class="panel" id="panel-0">
+                    <div class="panel-content">
+                        <div class="empty-panel">
+                            <div class="icon">📊</div>
+                            <div>Select a file from sidebar to view</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Petal walls from topology
+        const PETAL_WALLS = [5.56, 4.89, 4.19, 3.68, 3.22, 2.90, 2.49, 2.22, 1.93];
+
+        // State
+        let loadedFiles = [];
+        let currentLayout = 1;
+        let panels = [null, null, null, null];
+
+        // Parse training log and compute band statistics
+        function parseTrainingLog(content, filename) {
+            const lines = content.split('\n');
+            const steps = [];
+            const losses = [];
+
+            for (const line of lines) {
+                const match = line.match(/Step (\d+).*Loss: ([\d.]+)/);
+                if (match) {
+                    steps.push(parseInt(match[1]));
+                    losses.push(parseFloat(match[2]));
+                }
+            }
+
+            if (steps.length === 0) return null;
+
+            // Compute band statistics
+            const bandStats = computeBandStats(steps, losses);
+            const finalLoss = losses[losses.length - 1];
+            const totalSteps = steps[steps.length - 1];
+
+            return {
+                type: 'log',
+                filename,
+                steps,
+                losses,
+                bandStats,
+                finalLoss,
+                totalSteps,
+                dataPoints: steps.length
+            };
+        }
+
+        function computeBandStats(steps, losses) {
+            const bands = Array(9).fill(null).map(() => ({
+                visits: 0,
+                dwellSteps: 0,
+                deltaLoss: 0,
+                entries: []
+            }));
+
+            let currentBand = -1;
+            let bandEntryStep = 0;
+            let bandEntryLoss = 0;
+
+            for (let i = 0; i < losses.length; i++) {
+                const loss = losses[i];
+                const step = steps[i];
+                const band = getBand(loss);
+
+                if (band !== currentBand) {
+                    // Exiting previous band
+                    if (currentBand >= 0 && currentBand < 9) {
+                        const dwell = step - bandEntryStep;
+                        const delta = bandEntryLoss - loss;
+                        bands[currentBand].dwellSteps += dwell;
+                        bands[currentBand].deltaLoss += delta;
+                    }
+
+                    // Entering new band
+                    if (band >= 0 && band < 9) {
+                        bands[band].visits++;
+                        bandEntryStep = step;
+                        bandEntryLoss = loss;
+                    }
+                    currentBand = band;
+                }
+            }
+
+            // Close final band
+            if (currentBand >= 0 && currentBand < 9) {
+                const dwell = steps[steps.length - 1] - bandEntryStep;
+                const delta = bandEntryLoss - losses[losses.length - 1];
+                bands[currentBand].dwellSteps += dwell;
+                bands[currentBand].deltaLoss += delta;
+            }
+
+            // Compute derived stats
+            for (let i = 0; i < 9; i++) {
+                const b = bands[i];
+                b.absorptionRate = b.dwellSteps > 0 ? b.deltaLoss / b.dwellSteps : 0;
+                b.resistance = b.absorptionRate !== 0 ? 1 / b.absorptionRate : 0;
+            }
+
+            return bands;
+        }
+
+        function getBand(loss) {
+            for (let i = 0; i < PETAL_WALLS.length; i++) {
+                if (loss > PETAL_WALLS[i]) return i;
+            }
+            return 8;
+        }
+
+        // Get display name with parent directory
+        function getDisplayName(file) {
+            // webkitRelativePath gives full path if available, otherwise use name
+            const path = file.webkitRelativePath || file.name;
+            const parts = path.split('/');
+            if (parts.length >= 2) {
+                return parts.slice(-2).join('/');
+            }
+            return file.name;
+        }
+
+        // File handling
+        document.getElementById('logFileInput').addEventListener('change', (e) => {
+            for (const file of e.target.files) {
+                const reader = new FileReader();
+                const displayName = getDisplayName(file);
+                reader.onload = (ev) => {
+                    const data = parseTrainingLog(ev.target.result, displayName);
+                    if (data) {
+                        loadedFiles.push(data);
+                        updateFileList();
+                    }
+                };
+                reader.readAsText(file);
+            }
+            e.target.value = '';
+        });
+
+        document.getElementById('graphFileInput').addEventListener('change', (e) => {
+            for (const file of e.target.files) {
+                const reader = new FileReader();
+                const displayName = getDisplayName(file);
+                reader.onload = (ev) => {
+                    loadedFiles.push({
+                        type: 'graph',
+                        filename: displayName,
+                        dataUrl: ev.target.result
+                    });
+                    updateFileList();
+                };
+                reader.readAsDataURL(file);
+            }
+            e.target.value = '';
+        });
+
+        function updateFileList() {
+            const list = document.getElementById('fileList');
+
+            if (loadedFiles.length === 0) {
+                list.innerHTML = `<li class="file-item" style="color: #004400; border-style: dashed;">
+                    No files loaded. Use buttons above to load train.log files or graphs.
+                </li>`;
+                return;
+            }
+
+            list.innerHTML = loadedFiles.map((f, i) => `
+                <li class="file-item ${panels.includes(i) ? 'selected' : ''}">
+                    <div class="file-header">
+                        <button class="edit-btn" onclick="renameFile(${i}); event.stopPropagation();" title="Rename">✎</button>
+                        <div class="name" onclick="addToPanel(${i})">${f.type === 'log' ? '📄' : '📊'} ${f.filename}</div>
+                        <button class="remove-btn" onclick="removeFile(${i}); event.stopPropagation();">✕</button>
+                    </div>
+                    ${f.type === 'log' ? `
+                        <div class="stats" onclick="addToPanel(${i})">
+                            Steps: ${f.totalSteps?.toLocaleString() || 'N/A'} |
+                            Final: ${f.finalLoss?.toFixed(4) || 'N/A'}
+                        </div>
+                    ` : ''}
+                </li>
+            `).join('');
+        }
+
+        function setLayout(num) {
+            currentLayout = num;
+            const grid = document.getElementById('panelsGrid');
+            grid.className = `panels-grid layout-${num}`;
+
+            // Update layout buttons
+            document.querySelectorAll('.layout-btn').forEach((btn, i) => {
+                btn.classList.toggle('active', i === num - 1);
+            });
+
+            // Create panels
+            grid.innerHTML = '';
+            for (let i = 0; i < num; i++) {
+                const panel = document.createElement('div');
+                panel.className = 'panel';
+                panel.id = `panel-${i}`;
+
+                if (panels[i] !== null && loadedFiles[panels[i]]) {
+                    renderPanelContent(panel, loadedFiles[panels[i]], i);
+                } else {
+                    panel.innerHTML = `
+                        <div class="panel-content">
+                            <div class="empty-panel">
+                                <div class="icon">📊</div>
+                                <div>Select a file from sidebar</div>
+                            </div>
+                        </div>
+                    `;
+                }
+                grid.appendChild(panel);
+            }
+        }
+
+        function addToPanel(fileIndex) {
+            // Find first empty panel or use panel 0
+            let targetPanel = panels.findIndex(p => p === null);
+            if (targetPanel === -1) targetPanel = 0;
+            if (targetPanel >= currentLayout) targetPanel = 0;
+
+            panels[targetPanel] = fileIndex;
+            updateFileList();
+            setLayout(currentLayout);
+        }
+
+        function renderPanelContent(panel, file, panelIndex) {
+            if (file.type === 'log') {
+                panel.innerHTML = `
+                    <div class="panel-header">
+                        <span class="panel-title">${file.filename}</span>
+                        <div>
+                            <button class="fullscreen-btn" onclick="toggleFullscreen(${panelIndex})" title="Fullscreen">⤢</button>
+                            <button class="panel-close" onclick="closePanel(${panelIndex})">✕</button>
+                        </div>
+                    </div>
+                    <div class="panel-content">
+                        <div class="tabs">
+                            <div class="tab active" onclick="showTab(${panelIndex}, 'bands')">Bands</div>
+                            <div class="tab" onclick="showTab(${panelIndex}, 'summary')">Summary</div>
+                        </div>
+                        <div id="panel-${panelIndex}-bands">
+                            ${renderBandTable(file.bandStats)}
+                        </div>
+                        <div id="panel-${panelIndex}-summary" style="display:none;">
+                            ${renderSummary(file)}
+                        </div>
+                    </div>
+                `;
+            } else {
+                panel.innerHTML = `
+                    <div class="panel-header">
+                        <span class="panel-title">${file.filename}</span>
+                        <div>
+                            <button class="fullscreen-btn" onclick="toggleFullscreen(${panelIndex})" title="Fullscreen">⤢</button>
+                            <button class="panel-close" onclick="closePanel(${panelIndex})">✕</button>
+                        </div>
+                    </div>
+                    <div class="panel-content">
+                        <div class="graph-container">
+                            <img src="${file.dataUrl}" alt="${file.filename}">
+                        </div>
+                    </div>
+                `;
+            }
+        }
+
+        function renderBandTable(bandStats) {
+            let html = `
+                <table class="band-table">
+                    <tr>
+                        <th>Band</th>
+                        <th>Wall</th>
+                        <th>Visits</th>
+                        <th>Dwell</th>
+                        <th>ΔLoss</th>
+                        <th>Absorb</th>
+                        <th>Resist</th>
+                    </tr>
+            `;
+
+            for (let i = 0; i < 9; i++) {
+                const b = bandStats[i];
+                const resistClass = b.resistance > 200 ? 'wall' : (b.resistance < 0 ? 'negative' : 'positive');
+                const absorbClass = b.absorptionRate < 0 ? 'negative' : 'positive';
+
+                html += `
+                    <tr>
+                        <td>${i + 1}</td>
+                        <td>${PETAL_WALLS[i]?.toFixed(2) || '-'}</td>
+                        <td>${b.visits}</td>
+                        <td>${b.dwellSteps.toLocaleString()}</td>
+                        <td class="${b.deltaLoss >= 0 ? 'positive' : 'negative'}">${b.deltaLoss.toFixed(2)}</td>
+                        <td class="${absorbClass}">${b.absorptionRate.toFixed(6)}</td>
+                        <td class="${resistClass}">${b.resistance.toFixed(2)}</td>
+                    </tr>
+                `;
+            }
+
+            html += '</table>';
+            return html;
+        }
+
+        function renderSummary(file) {
+            return `
+                <div class="summary-stats">
+                    <div class="stat-box">
+                        <div class="label">TOTAL STEPS</div>
+                        <div class="value">${file.totalSteps?.toLocaleString() || 'N/A'}</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="label">FINAL LOSS</div>
+                        <div class="value">${file.finalLoss?.toFixed(4) || 'N/A'}</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="label">DATA POINTS</div>
+                        <div class="value">${file.dataPoints?.toLocaleString() || 'N/A'}</div>
+                    </div>
+                </div>
+                <div class="stat-box" style="margin-bottom: 10px;">
+                    <div class="label">HARDEST BAND (MAX RESISTANCE)</div>
+                    <div class="value" style="color: #ffff00;">
+                        Band ${file.bandStats.reduce((max, b, i) => b.resistance > file.bandStats[max].resistance ? i : max, 0) + 1}
+                        (${Math.max(...file.bandStats.map(b => b.resistance)).toFixed(2)})
+                    </div>
+                </div>
+            `;
+        }
+
+        function showTab(panelIndex, tabName) {
+            const panel = document.getElementById(`panel-${panelIndex}`);
+            panel.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            panel.querySelectorAll('[id^="panel-' + panelIndex + '-"]').forEach(c => c.style.display = 'none');
+
+            event.target.classList.add('active');
+            document.getElementById(`panel-${panelIndex}-${tabName}`).style.display = 'block';
+        }
+
+        function closePanel(panelIndex) {
+            panels[panelIndex] = null;
+            updateFileList();
+            setLayout(currentLayout);
+        }
+
+        function renameFile(fileIndex) {
+            const newName = prompt('Enter new name:', loadedFiles[fileIndex].filename);
+            if (newName && newName.trim()) {
+                loadedFiles[fileIndex].filename = newName.trim();
+                updateFileList();
+                setLayout(currentLayout); // Refresh panels with new name
+            }
+        }
+
+        function removeFile(fileIndex) {
+            // Remove file from loadedFiles
+            loadedFiles.splice(fileIndex, 1);
+
+            // Update panels - remove references to deleted file and shift indices
+            for (let i = 0; i < panels.length; i++) {
+                if (panels[i] === fileIndex) {
+                    panels[i] = null;
+                } else if (panels[i] !== null && panels[i] > fileIndex) {
+                    panels[i]--;
+                }
+            }
+
+            updateFileList();
+            setLayout(currentLayout);
+        }
+
+        function toggleFullscreen(panelIndex) {
+            const panel = document.getElementById(`panel-${panelIndex}`);
+            panel.classList.toggle('fullscreen');
+
+            // Update button icon
+            const btn = panel.querySelector('.fullscreen-btn');
+            if (panel.classList.contains('fullscreen')) {
+                btn.textContent = '⤡';
+                btn.title = 'Exit fullscreen';
+            } else {
+                btn.textContent = '⤢';
+                btn.title = 'Fullscreen';
+            }
+        }
+
+        function clearAll() {
+            loadedFiles = [];
+            panels = [null, null, null, null];
+            updateFileList();
+            setLayout(currentLayout);
+        }
+
+        // ESC key to exit fullscreen
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                const fullscreenPanel = document.querySelector('.panel.fullscreen');
+                if (fullscreenPanel) {
+                    const panelIndex = parseInt(fullscreenPanel.id.split('-')[1]);
+                    toggleFullscreen(panelIndex);
+                }
+            }
+        });
+
+        // Initialize
+        setLayout(1);
+    </script>
+</body>
+</html>

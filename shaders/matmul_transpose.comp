@@ -1,0 +1,169 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+
+// Register-blocked tiled matrix multiply with transposes: C = op(A) @ op(B)
+// where op(X) can be X or X^T
+//
+// Critical for backprop through linear layers:
+// - grad_input  = weight^T @ grad_output  (transpose_A=1)
+// - grad_weight = grad_output @ input^T    (transpose_B=1)
+//
+// MATMUL_TILE, MATMUL_REG, MATMUL_BK set via glslc -D from the hardware sweep.
+
+#define WG_X (MATMUL_TILE / MATMUL_REG)
+#define WG_Y (MATMUL_TILE / MATMUL_REG)
+
+layout(local_size_x = WG_X, local_size_y = WG_Y) in;
+
+layout(binding = 0) readonly buffer BufferA { float A[]; };
+layout(binding = 1) readonly buffer BufferB { float B[]; };
+layout(binding = 2) buffer BufferC { float C[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // Rows of result C
+    uint N;             // Cols of result C
+    uint K;             // Inner dimension
+    uint transpose_A;   // 0 = no transpose, 1 = transpose
+    uint transpose_B;   // 0 = no transpose, 1 = transpose
+    uint accumulate;    // 0 = overwrite C, 1 = C += result (for gradient accumulation)
+} params;
+
+// Shared memory tiles with +1 padding to avoid bank conflicts
+shared float sA[MATMUL_TILE][MATMUL_BK + 1];
+shared float sB[MATMUL_BK][MATMUL_TILE + 1];
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    const uint tid = ty * WG_X + tx;
+    const uint num_threads = WG_X * WG_Y;
+
+    const uint block_row = gl_WorkGroupID.y * MATMUL_TILE;
+    const uint block_col = gl_WorkGroupID.x * MATMUL_TILE;
+
+    // Accumulator registers: MATMUL_REG×MATMUL_REG per thread
+    float acc[MATMUL_REG][MATMUL_REG];
+    [[unroll]] for (uint i = 0; i < MATMUL_REG; i++)
+        [[unroll]] for (uint j = 0; j < MATMUL_REG; j++)
+            acc[i][j] = 0.0;
+
+    // K-dimension loop in MATMUL_BK-sized tiles
+    uint bk = 0;
+
+    // Interior tiles: no K bounds check
+    for (; bk + MATMUL_BK <= params.K; bk += MATMUL_BK) {
+        // Load A tile into shared memory (handles transpose)
+        for (uint idx = tid; idx < MATMUL_TILE * MATMUL_BK; idx += num_threads) {
+            uint si = idx / MATMUL_BK;
+            uint sj = idx % MATMUL_BK;
+            uint grow = block_row + si;
+            uint gk = bk + sj;
+            if (grow < params.M) {
+                uint a_idx = (params.transpose_A == 0) ?
+                    (grow * params.K + gk) :       // A[row, k]
+                    (gk * params.M + grow);        // A^T: A stored [K, M], access A[k, row]
+                sA[si][sj] = A[a_idx];
+            } else {
+                sA[si][sj] = 0.0;
+            }
+        }
+        // Load B tile into shared memory (handles transpose)
+        for (uint idx = tid; idx < MATMUL_BK * MATMUL_TILE; idx += num_threads) {
+            uint si = idx / MATMUL_TILE;
+            uint sj = idx % MATMUL_TILE;
+            uint gk = bk + si;
+            uint gcol = block_col + sj;
+            if (gcol < params.N) {
+                uint b_idx = (params.transpose_B == 0) ?
+                    (gk * params.N + gcol) :       // B[k, col]
+                    (gcol * params.K + gk);        // B^T: B stored [N, K], access B[col, k]
+                sB[si][sj] = B[b_idx];
+            } else {
+                sB[si][sj] = 0.0;
+            }
+        }
+
+        barrier();
+
+        // Compute: each thread does MATMUL_REG×MATMUL_REG outer products over MATMUL_BK
+        for (uint k = 0; k < MATMUL_BK; k++) {
+            float a[MATMUL_REG];
+            [[unroll]] for (uint i = 0; i < MATMUL_REG; i++)
+                a[i] = sA[ty * MATMUL_REG + i][k];
+            float b[MATMUL_REG];
+            [[unroll]] for (uint j = 0; j < MATMUL_REG; j++)
+                b[j] = sB[k][tx * MATMUL_REG + j];
+            [[unroll]] for (uint i = 0; i < MATMUL_REG; i++)
+                [[unroll]] for (uint j = 0; j < MATMUL_REG; j++)
+                    acc[i][j] += a[i] * b[j];
+        }
+
+        barrier();
+    }
+
+    // Last partial tile (if K not multiple of MATMUL_BK)
+    if (bk < params.K) {
+        uint remaining = params.K - bk;
+        for (uint idx = tid; idx < MATMUL_TILE * MATMUL_BK; idx += num_threads) {
+            uint si = idx / MATMUL_BK;
+            uint sj = idx % MATMUL_BK;
+            uint grow = block_row + si;
+            uint gk = bk + sj;
+            if (grow < params.M && gk < params.K) {
+                uint a_idx = (params.transpose_A == 0) ?
+                    (grow * params.K + gk) :
+                    (gk * params.M + grow);
+                sA[si][sj] = A[a_idx];
+            } else {
+                sA[si][sj] = 0.0;
+            }
+        }
+        for (uint idx = tid; idx < MATMUL_BK * MATMUL_TILE; idx += num_threads) {
+            uint si = idx / MATMUL_TILE;
+            uint sj = idx % MATMUL_TILE;
+            uint gk = bk + si;
+            uint gcol = block_col + sj;
+            if (gk < params.K && gcol < params.N) {
+                uint b_idx = (params.transpose_B == 0) ?
+                    (gk * params.N + gcol) :
+                    (gcol * params.K + gk);
+                sB[si][sj] = B[b_idx];
+            } else {
+                sB[si][sj] = 0.0;
+            }
+        }
+
+        barrier();
+
+        for (uint k = 0; k < remaining; k++) {
+            float a[MATMUL_REG];
+            [[unroll]] for (uint i = 0; i < MATMUL_REG; i++)
+                a[i] = sA[ty * MATMUL_REG + i][k];
+            float b[MATMUL_REG];
+            [[unroll]] for (uint j = 0; j < MATMUL_REG; j++)
+                b[j] = sB[k][tx * MATMUL_REG + j];
+            [[unroll]] for (uint i = 0; i < MATMUL_REG; i++)
+                [[unroll]] for (uint j = 0; j < MATMUL_REG; j++)
+                    acc[i][j] += a[i] * b[j];
+        }
+
+        barrier();
+    }
+
+    // Store MATMUL_REG×MATMUL_REG results to global memory
+    // No `continue` — breaks unroll. Single guard inside the body.
+    [[unroll]] for (uint i = 0; i < MATMUL_REG; i++) {
+        [[unroll]] for (uint j = 0; j < MATMUL_REG; j++) {
+            uint grow = block_row + ty * MATMUL_REG + i;
+            uint gcol = block_col + tx * MATMUL_REG + j;
+            if (grow < params.M && gcol < params.N) {
+                uint c_idx = grow * params.N + gcol;
+                if (params.accumulate == 1) {
+                    C[c_idx] += acc[i][j];
+                } else {
+                    C[c_idx] = acc[i][j];
+                }
+            }
+        }
+    }
+}

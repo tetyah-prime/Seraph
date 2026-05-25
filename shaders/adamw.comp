@@ -1,0 +1,61 @@
+#version 450
+
+// AdamW Optimizer Update
+// weight -= lr * m_hat / (sqrt(v_hat) + eps) + lr * weight_decay * weight
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) buffer BufferWeight {
+    float weight[];
+};
+
+layout(binding = 1) readonly buffer BufferGrad {
+    float grad[];
+};
+
+layout(binding = 2) buffer BufferM {
+    float m[];
+};
+
+layout(binding = 3) buffer BufferV {
+    float v[];
+};
+
+layout(push_constant) uniform PushConstants {
+    float lr;
+    float beta1;
+    float beta2;
+    float weight_decay;
+    float eps;
+    float bias_correction1;  // 1 - beta1^step
+    float bias_correction2;  // 1 - beta2^step
+    uint size;
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    if (idx >= params.size) {
+        return;
+    }
+
+    float g = grad[idx];
+    float w = weight[idx];
+
+    // Update biased first moment: m = beta1 * m + (1 - beta1) * grad
+    float m_new = params.beta1 * m[idx] + (1.0 - params.beta1) * g;
+    m[idx] = m_new;
+
+    // Update biased second moment: v = beta2 * v + (1 - beta2) * grad^2
+    float v_new = params.beta2 * v[idx] + (1.0 - params.beta2) * g * g;
+    v[idx] = v_new;
+
+    // Bias-corrected estimates
+    float m_hat = m_new / params.bias_correction1;
+    float v_hat = v_new / params.bias_correction2;
+
+    // Fused weight update: w = w*(1 - lr*wd) - lr*m_hat/(sqrt(v_hat)+eps)
+    // Single expression, single write (matches CUDA FP rounding)
+    weight[idx] = w * (1.0 - params.lr * params.weight_decay) - params.lr * m_hat / (sqrt(v_hat) + params.eps);
+}

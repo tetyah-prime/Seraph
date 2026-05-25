@@ -1,0 +1,66 @@
+#version 450
+
+// RMSNorm forward pass
+//
+// For each row:
+//   rms = sqrt(mean(x^2) + eps)
+//   y[i] = x[i] / rms * scale[i]
+//
+// Memory layout:
+//   input:  [rows, cols]
+//   scale:  [cols]
+//   output: [rows, cols]
+//
+// Dispatch: (rows, 1, 1) workgroups
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer BufferInput { float input_data[]; };
+layout(binding = 1) readonly buffer BufferScale { float scale[]; };
+layout(binding = 2) writeonly buffer BufferOutput { float output_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint cols;
+    float eps;
+} params;
+
+shared float s_sum[LOCAL_SIZE_X];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (row >= params.rows) return;
+
+    uint row_base = row * params.cols;
+
+    // Sum of squares reduction
+    float local = 0.0;
+    uint num_threads = gl_WorkGroupSize.x;
+    for (uint c = tid; c < params.cols; c += num_threads) {
+        float x = input_data[row_base + c];
+        local += x * x;
+    }
+
+    s_sum[tid] = local;
+    barrier();
+
+    for (uint offset = num_threads / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            s_sum[tid] += s_sum[tid + offset];
+        }
+        barrier();
+    }
+
+    float mean_sq = s_sum[0] / float(params.cols);
+    float inv_rms = inversesqrt(mean_sq + params.eps);
+
+    // Normalize and scale
+    for (uint c = tid; c < params.cols; c += num_threads) {
+        float x = input_data[row_base + c];
+        output_data[row_base + c] = x * inv_rms * scale[c];
+    }
+}
+

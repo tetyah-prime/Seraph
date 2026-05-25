@@ -1,0 +1,149 @@
+#version 450
+
+// Fused Multi-Head Attention with Causal Mask
+//
+// Computes: out = softmax(Q @ K^T / sqrt(d) + causal_mask) @ V
+//
+// Memory layout (all row-major):
+//   Q: [seq_len, num_heads * head_dim]
+//   K: [seq_len, kv_heads * head_dim]
+//   V: [seq_len, kv_heads * head_dim]
+//   out: [seq_len, num_heads * head_dim]
+//
+// Dispatch: (num_heads, seq_len, 1) workgroups
+// Each workgroup computes output for one (head, query_position) pair
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer BufferQ { float Q[]; };
+layout(binding = 1) readonly buffer BufferK { float K[]; };
+layout(binding = 2) readonly buffer BufferV { float V[]; };
+layout(binding = 3) writeonly buffer BufferOut { float attn_out[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint num_heads;
+    uint kv_heads;
+    uint head_dim;
+    float scale;  // 1.0 / sqrt(head_dim)
+} params;
+
+// Shared memory for attention scores and reductions
+// Max seq_len = 2048 for now (can increase if needed)
+shared float s_scores[2048];
+shared float s_local_max[LOCAL_SIZE_X];
+shared float s_local_sum[LOCAL_SIZE_X];
+shared float s_max;
+shared float s_sum;
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint query_pos = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint num_threads = gl_WorkGroupSize.x;
+
+    if (head >= params.num_heads || query_pos >= params.seq_len) return;
+
+    // GQA: map query head to KV head
+    // If num_heads=32, kv_heads=8, then heads 0-3 share kv_head 0, etc.
+    uint kv_head = head * params.kv_heads / params.num_heads;
+
+    // Causal attention: only attend to positions 0..query_pos
+    uint attend_len = query_pos + 1;
+
+    // Q offset for this (query_pos, head)
+    uint q_offset = query_pos * params.num_heads * params.head_dim + head * params.head_dim;
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 1: Compute attention scores = Q @ K^T
+    // ═══════════════════════════════════════════════════════════════════════
+
+    for (uint j = tid; j < attend_len; j += num_threads) {
+        uint k_offset = j * params.kv_heads * params.head_dim + kv_head * params.head_dim;
+
+        float score = 0.0;
+        for (uint d = 0; d < params.head_dim; d++) {
+            score += Q[q_offset + d] * K[k_offset + d];
+        }
+        s_scores[j] = score * params.scale;
+    }
+
+    // Initialize positions beyond attend_len to -inf (won't be used but safe)
+    for (uint j = attend_len + tid; j < params.seq_len && j < 2048; j += num_threads) {
+        s_scores[j] = -1e9;
+    }
+    barrier();
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 2: Stable softmax - find max
+    // ═══════════════════════════════════════════════════════════════════════
+
+    float local_max = -1e9;
+    for (uint j = tid; j < attend_len; j += num_threads) {
+        local_max = max(local_max, s_scores[j]);
+    }
+
+    s_local_max[tid] = local_max;
+    barrier();
+
+    // Tree reduction for max (balanced FP — matches CUDA warp shuffle pattern)
+    for (uint stride = num_threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_local_max[tid] = max(s_local_max[tid], s_local_max[tid + stride]);
+        }
+        barrier();
+    }
+    if (tid == 0) s_max = s_local_max[0];
+    barrier();
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 3: Compute exp(score - max) and sum
+    // ═══════════════════════════════════════════════════════════════════════
+
+    float local_sum = 0.0;
+    for (uint j = tid; j < attend_len; j += num_threads) {
+        float val = exp(s_scores[j] - s_max);
+        s_scores[j] = val;
+        local_sum += val;
+    }
+
+    s_local_sum[tid] = local_sum;
+    barrier();
+
+    // Tree reduction for sum (balanced FP — matches CUDA warp shuffle pattern)
+    for (uint stride = num_threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_local_sum[tid] += s_local_sum[tid + stride];
+        }
+        barrier();
+    }
+    if (tid == 0) s_sum = s_local_sum[0];
+    barrier();
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 4: Normalize to get attention weights
+    // ═══════════════════════════════════════════════════════════════════════
+
+    float inv_sum = 1.0 / s_sum;
+    for (uint j = tid; j < attend_len; j += num_threads) {
+        s_scores[j] *= inv_sum;
+    }
+    barrier();
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 5: Compute output = attention_weights @ V
+    // ═══════════════════════════════════════════════════════════════════════
+
+    uint out_offset = query_pos * params.num_heads * params.head_dim + head * params.head_dim;
+
+    // Each thread handles a subset of head_dim dimensions
+    for (uint d = tid; d < params.head_dim; d += num_threads) {
+        float sum = 0.0;
+        for (uint j = 0; j < attend_len; j++) {
+            uint v_offset = j * params.kv_heads * params.head_dim + kv_head * params.head_dim;
+            sum += s_scores[j] * V[v_offset + d];
+        }
+        attn_out[out_offset + d] = sum;
+    }
+}

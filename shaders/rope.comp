@@ -1,0 +1,73 @@
+#version 450
+
+// Rotary Position Embedding (RoPE)
+//
+// Applies rotation to pairs of dimensions based on position:
+//   out[2i]   = x[2i] * cos(pos * theta_i) - x[2i+1] * sin(pos * theta_i)
+//   out[2i+1] = x[2i] * sin(pos * theta_i) + x[2i+1] * cos(pos * theta_i)
+//
+// where theta_i = 1.0 / (rope_theta ^ (2i / head_dim))
+//
+// Memory layout:
+//   x: [seq_len, num_heads * head_dim]  (Q or K tensor)
+//   out: [seq_len, num_heads * head_dim] (can be same as x for in-place)
+//
+// Dispatch: ceil(seq_len * num_heads * head_dim / 2 / 256) workgroups
+// Each thread handles one pair of dimensions
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint LOCAL_SIZE_X = 1; // set at pipeline creation from hardware
+
+layout(binding = 0) readonly buffer BufferIn { float x_in[]; };
+layout(binding = 1) writeonly buffer BufferOut { float x_out[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint num_heads;
+    uint head_dim;
+    float rope_theta;  // Usually 10000.0
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    // Total pairs = seq_len * num_heads * (head_dim / 2)
+    uint total_pairs = params.seq_len * params.num_heads * (params.head_dim / 2);
+    if (idx >= total_pairs) return;
+
+    // Decompose index into (pos, head, pair_idx)
+    uint pairs_per_head = params.head_dim / 2;
+    uint pairs_per_pos = params.num_heads * pairs_per_head;
+
+    uint pos = idx / pairs_per_pos;
+    uint remainder = idx % pairs_per_pos;
+    uint head = remainder / pairs_per_head;
+    uint pair_idx = remainder % pairs_per_head;  // Which pair within head (0 to head_dim/2 - 1)
+
+    // Compute theta for this dimension pair
+    // theta_i = 1.0 / (rope_theta ^ (2 * pair_idx / head_dim))
+    float exponent = float(2 * pair_idx) / float(params.head_dim);
+    float inv_freq = 1.0 / pow(params.rope_theta, exponent);
+
+    // Angle = position * inverse_frequency
+    float angle = float(pos) * inv_freq;
+    float cos_angle = cos(angle);
+    float sin_angle = sin(angle);
+
+    // Input indices
+    uint base_idx = pos * params.num_heads * params.head_dim + head * params.head_dim;
+    uint i0 = base_idx + 2 * pair_idx;
+    uint i1 = base_idx + 2 * pair_idx + 1;
+
+    // Read pair
+    float x0 = x_in[i0];
+    float x1 = x_in[i1];
+
+    // Apply rotation
+    float out0 = x0 * cos_angle - x1 * sin_angle;
+    float out1 = x0 * sin_angle + x1 * cos_angle;
+
+    // Write pair
+    x_out[i0] = out0;
+    x_out[i1] = out1;
+}
