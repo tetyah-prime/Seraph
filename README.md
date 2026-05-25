@@ -1,7 +1,7 @@
 # Seraph
 
 <p align="center">
-  <img src="pic1.png" alt="Seraph" width="1280">
+  <img src="banner.png" alt="Seraph" width="1280">
 </p>
 
 ![License](https://img.shields.io/badge/license-GPL%20v3-blue)
